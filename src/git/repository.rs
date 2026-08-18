@@ -63,4 +63,35 @@ impl GitRepository {
             is_bare,
         }
     }
+
+    pub fn commits(
+        &self,
+        max_count: usize,
+    ) -> Result<Vec<crate::git::commit::CommitInfo>, git2::Error> {
+        let mut revwalk = self.repo.revwalk()?;
+        revwalk.push_head()?;
+        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+
+        let mut commits = Vec::new();
+        for oid in revwalk.take(max_count) {
+            let oid = oid?;
+            let commit = self.repo.find_commit(oid)?;
+
+            let parents = commit.parent_ids().map(|id| id.to_string()).collect();
+            let author = commit.author().name().unwrap_or("unknown").to_string();
+            let timestamp = commit.time().seconds();
+            let summary = commit.summary().unwrap_or(None).unwrap_or("").to_string();
+            let message = commit.message().unwrap_or("").to_string();
+
+            commits.push(crate::git::commit::CommitInfo {
+                oid: oid.to_string(),
+                parents,
+                author,
+                timestamp,
+                summary,
+                message,
+            });
+        }
+        Ok(commits)
+    }
 }

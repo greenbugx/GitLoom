@@ -53,10 +53,13 @@ where
             .draw(|f| ui::render(f, app_state))
             .map_err(|e| e.into())?;
 
-        if let Event::Key(key) = event::read()?
-            && key.code == KeyCode::Char('q')
-        {
-            app_state.quit = true;
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Char('q') => app_state.quit = true,
+                KeyCode::Char('j') | KeyCode::Down => app_state.next_commit(),
+                KeyCode::Char('k') | KeyCode::Up => app_state.previous_commit(),
+                _ => {}
+            }
         }
     }
     Ok(())

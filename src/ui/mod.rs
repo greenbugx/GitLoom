@@ -2,10 +2,11 @@ use crate::app::{AppState, RepoState};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
-    widgets::{Block, Paragraph},
+    style::{Color, Modifier, Style},
+    widgets::{Block, List, ListItem, Paragraph},
 };
 
-pub fn render(f: &mut Frame, state: &AppState) {
+pub fn render(f: &mut Frame, state: &mut AppState) {
     let vertical = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
@@ -21,30 +22,52 @@ pub fn render(f: &mut Frame, state: &AppState) {
 
     let graph_block = Block::bordered().title("GRAPH AREA");
 
-    let content = match &state.repo_state {
-        RepoState::None => "\n  No repository loaded".to_string(),
-        RepoState::Error(err) => format!("\n  Error: {}", err),
-        RepoState::Loaded(_, info) => {
-            if info.is_bare {
-                format!("\n  Repository\n  {}\n\n  Bare repository", info.name)
-            } else {
-                format!(
-                    "\n  Repository\n  {}\n\n  Branch\n  {}\n\n  Status\n  {}",
-                    info.name,
-                    info.branch,
-                    if info.is_clean { "Clean" } else { "Dirty" }
-                )
+    if state.commits.is_empty() {
+        let content = match &state.repo_state {
+            RepoState::None => "\n  No repository loaded".to_string(),
+            RepoState::Error(err) => format!("\n  Error: {}", err),
+            RepoState::Loaded(_, info) => {
+                if info.is_bare {
+                    format!("\n  Repository\n  {}\n\n  Bare repository", info.name)
+                } else {
+                    format!(
+                        "\n  Repository\n  {}\n\n  Branch\n  {}\n\n  Status\n  {}",
+                        info.name,
+                        info.branch,
+                        if info.is_clean { "Clean" } else { "Dirty" }
+                    )
+                }
             }
-        }
-    };
+        };
 
-    let graph_text = Paragraph::new(content).block(graph_block);
-    f.render_widget(graph_text, main_chunks[0]);
+        let graph_text = Paragraph::new(content).block(graph_block);
+        f.render_widget(graph_text, main_chunks[0]);
+    } else {
+        let items: Vec<ListItem> = state
+            .commits
+            .iter()
+            .map(|c| {
+                let content = format!("{} {}", c.short_oid(), c.summary);
+                ListItem::new(content)
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(graph_block)
+            .highlight_style(
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Yellow),
+            )
+            .highlight_symbol(">> ");
+
+        f.render_stateful_widget(list, main_chunks[0], &mut state.list_state);
+    }
 
     let details_block = Block::bordered().title("DETAILS AREA");
     f.render_widget(details_block, main_chunks[1]);
 
     let bottom_block = Block::bordered();
-    let bottom_text = Paragraph::new(" q Quit").block(bottom_block);
+    let bottom_text = Paragraph::new(" ↑/↓ j/k Navigate   q Quit").block(bottom_block);
     f.render_widget(bottom_text, chunks[2]);
 }
