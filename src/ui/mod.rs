@@ -46,8 +46,9 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         let items: Vec<ListItem> = state
             .commits
             .iter()
-            .map(|c| {
-                let content = format!("{} {}", c.short_oid(), c.summary);
+            .zip(state.graph_rows.iter())
+            .map(|(c, r)| {
+                let content = format!("{}  {}  {}", r.glyphs, c.short_oid(), c.summary);
                 ListItem::new(content)
             })
             .collect();

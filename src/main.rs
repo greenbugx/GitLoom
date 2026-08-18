@@ -1,10 +1,10 @@
-use gitloom::app::AppState;
-use gitloom::ui;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use gitloom::app::AppState;
+use gitloom::ui;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{error::Error, io};
 

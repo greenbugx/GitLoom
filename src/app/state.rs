@@ -3,6 +3,8 @@ use crate::git::repository::{GitRepository, RepoInfo};
 use ratatui::widgets::ListState;
 use std::path::PathBuf;
 
+use crate::graph::layout::{GraphEngine, GraphRow};
+
 pub enum RepoState {
     None,
     Error(String),
@@ -13,6 +15,7 @@ pub struct AppState {
     pub quit: bool,
     pub repo_state: RepoState,
     pub commits: Vec<CommitInfo>,
+    pub graph_rows: Vec<GraphRow>,
     pub list_state: ListState,
 }
 
@@ -28,6 +31,7 @@ impl AppState {
             path.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
         let mut commits = Vec::new();
+        let mut graph_rows = Vec::new();
         let mut list_state = ListState::default();
 
         let repo_state = match GitRepository::open(&search_path) {
@@ -35,6 +39,19 @@ impl AppState {
                 let info = repo.info();
                 if let Ok(loaded_commits) = repo.commits(1000) {
                     commits = loaded_commits;
+                    graph_rows = GraphEngine::build(&commits);
+
+                    let max_width = graph_rows
+                        .iter()
+                        .map(|r| r.glyphs.chars().count())
+                        .max()
+                        .unwrap_or(0);
+                    for row in &mut graph_rows {
+                        let current_len = row.glyphs.chars().count();
+                        if current_len < max_width {
+                            row.glyphs.push_str(&" ".repeat(max_width - current_len));
+                        }
+                    }
                 }
                 if !commits.is_empty() {
                     list_state.select(Some(0));
@@ -48,6 +65,7 @@ impl AppState {
             quit: false,
             repo_state,
             commits,
+            graph_rows,
             list_state,
         }
     }
