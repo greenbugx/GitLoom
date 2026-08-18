@@ -50,11 +50,21 @@ where
             .map_err(|e| e.into())?;
 
         if let Event::Key(key) = event::read()? {
-            match key.code {
-                KeyCode::Char('q') => app_state.quit = true,
-                KeyCode::Char('j') | KeyCode::Down => app_state.next_commit(),
-                KeyCode::Char('k') | KeyCode::Up => app_state.previous_commit(),
-                _ => {}
+            if app_state.commit_details.is_some() {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => app_state.close_details(),
+                    KeyCode::Char('j') | KeyCode::Down => app_state.scroll_details_down(),
+                    KeyCode::Char('k') | KeyCode::Up => app_state.scroll_details_up(),
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Char('q') => app_state.quit = true,
+                    KeyCode::Char('j') | KeyCode::Down => app_state.next_commit(),
+                    KeyCode::Char('k') | KeyCode::Up => app_state.previous_commit(),
+                    KeyCode::Enter => app_state.load_details(),
+                    _ => {}
+                }
             }
         }
     }

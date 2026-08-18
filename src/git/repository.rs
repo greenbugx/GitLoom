@@ -94,4 +94,42 @@ impl GitRepository {
         }
         Ok(commits)
     }
+
+    pub fn commit_details(
+        &self,
+        oid_str: &str,
+    ) -> Result<crate::git::commit::CommitDetails, git2::Error> {
+        let oid = git2::Oid::from_str(oid_str)?;
+        let commit = self.repo.find_commit(oid)?;
+
+        let author = commit.author().name().unwrap_or("unknown").to_string();
+        let time = commit.time();
+        let parents: Vec<String> = commit.parent_ids().map(|id| id.to_string()).collect();
+        let summary = commit.summary().unwrap_or(None).unwrap_or("").to_string();
+        let message = commit.message().unwrap_or("").to_string();
+
+        let tree = commit.tree()?;
+        let parent_tree = if commit.parent_count() > 0 {
+            Some(commit.parent(0)?.tree()?)
+        } else {
+            None
+        };
+
+        let diff = self
+            .repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+        let stats = diff.stats()?;
+
+        Ok(crate::git::commit::CommitDetails {
+            oid: oid_str.to_string(),
+            summary,
+            message,
+            author,
+            date: time.seconds(),
+            parents,
+            files_changed: stats.files_changed(),
+            insertions: stats.insertions(),
+            deletions: stats.deletions(),
+        })
+    }
 }

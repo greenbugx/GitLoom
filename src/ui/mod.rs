@@ -66,9 +66,38 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     }
 
     let details_block = Block::bordered().title("DETAILS AREA");
-    f.render_widget(details_block, main_chunks[1]);
+    if let Some(details) = &state.commit_details {
+        let date_str = chrono::DateTime::from_timestamp(details.date, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        let parent_str = if details.parents.is_empty() {
+            "None".to_string()
+        } else {
+            details.parents[0].clone()
+        };
+
+        let content = format!(
+            "\n  Commit\n  {}\n\n  {}\n\n  Author: {}\n\n  Date: {}\n\n  Parent: {}\n\n  Files changed: {}\n\n  Insertions: +{}\n\n  Deletions: -{}",
+            details.oid.chars().take(7).collect::<String>(),
+            details.summary,
+            details.author,
+            date_str,
+            parent_str.chars().take(7).collect::<String>(),
+            details.files_changed,
+            details.insertions,
+            details.deletions
+        );
+        let details_text = Paragraph::new(content)
+            .block(details_block)
+            .scroll((state.details_scroll, 0));
+        f.render_widget(details_text, main_chunks[1]);
+    } else {
+        f.render_widget(details_block, main_chunks[1]);
+    }
 
     let bottom_block = Block::bordered();
-    let bottom_text = Paragraph::new(" ↑/↓ j/k Navigate   q Quit").block(bottom_block);
+    let bottom_text = Paragraph::new(" ↑/↓ j/k Navigate   Enter Inspect   Esc Close   q Quit")
+        .block(bottom_block);
     f.render_widget(bottom_text, chunks[2]);
 }

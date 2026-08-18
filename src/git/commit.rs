@@ -12,3 +12,16 @@ impl CommitInfo {
         self.oid.chars().take(7).collect()
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct CommitDetails {
+    pub oid: String,
+    pub summary: String,
+    pub message: String,
+    pub author: String,
+    pub date: i64,
+    pub parents: Vec<String>,
+    pub files_changed: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+}

@@ -3,6 +3,7 @@ use crate::git::repository::{GitRepository, RepoInfo};
 use ratatui::widgets::ListState;
 use std::path::PathBuf;
 
+use crate::git::commit::CommitDetails;
 use crate::graph::layout::{GraphEngine, GraphRow};
 
 pub enum RepoState {
@@ -17,6 +18,8 @@ pub struct AppState {
     pub commits: Vec<CommitInfo>,
     pub graph_rows: Vec<GraphRow>,
     pub list_state: ListState,
+    pub commit_details: Option<CommitDetails>,
+    pub details_scroll: u16,
 }
 
 impl Default for AppState {
@@ -67,6 +70,8 @@ impl AppState {
             commits,
             graph_rows,
             list_state,
+            commit_details: None,
+            details_scroll: 0,
         }
     }
 
@@ -102,5 +107,33 @@ impl AppState {
             None => 0,
         };
         self.list_state.select(Some(i));
+    }
+
+    pub fn load_details(&mut self) {
+        if let Some(idx) = self.list_state.selected()
+            && let Some(commit) = self.commits.get(idx)
+            && let RepoState::Loaded(repo, _) = &self.repo_state
+            && let Ok(details) = repo.commit_details(&commit.oid)
+        {
+            self.commit_details = Some(details);
+            self.details_scroll = 0;
+        }
+    }
+
+    pub fn close_details(&mut self) {
+        self.commit_details = None;
+    }
+
+    pub fn scroll_details_down(&mut self) {
+        let max_content_lines: u16 = 30;
+        let term_height = crossterm::terminal::size().map(|s| s.1).unwrap_or(24);
+        let visible_height = term_height.saturating_sub(8); 
+        let max_scroll = max_content_lines.saturating_sub(visible_height);
+
+        self.details_scroll = self.details_scroll.saturating_add(1).min(max_scroll);
+    }
+
+    pub fn scroll_details_up(&mut self) {
+        self.details_scroll = self.details_scroll.saturating_sub(1);
     }
 }
