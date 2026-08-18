@@ -3,15 +3,6 @@
 version = 4
 
 [[package]]
-name = "GitLoom"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "git2",
- "ratatui",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -470,6 +461,15 @@ dependencies = [
  "libc",
  "libgit2-sys",
  "log",
+]
+
+[[package]]
+name = "gitloom"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "git2",
+ "ratatui",
 ]
 
 [[package]]

@@ -1,9 +1,5 @@
-pub mod app;
-pub mod git;
-pub mod graph;
-pub mod ui;
-
-use app::AppState;
+use gitloom::app::AppState;
+use gitloom::ui;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
