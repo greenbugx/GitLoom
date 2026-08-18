@@ -65,39 +65,87 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         f.render_stateful_widget(list, main_chunks[0], &mut state.list_state);
     }
 
-    let details_block = Block::bordered().title("DETAILS AREA");
-    if let Some(details) = &state.commit_details {
-        let date_str = chrono::DateTime::from_timestamp(details.date, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_else(|| "Unknown".to_string());
+    let details_block = Block::bordered().title(match state.view_mode {
+        crate::app::ViewMode::Details => "DETAILS AREA",
+        crate::app::ViewMode::Files => "CHANGED FILES",
+        crate::app::ViewMode::Diff => "DIFF",
+        crate::app::ViewMode::Graph => "DETAILS AREA",
+    });
 
-        let parent_str = if details.parents.is_empty() {
-            "None".to_string()
-        } else {
-            details.parents[0].clone()
-        };
+    match state.view_mode {
+        crate::app::ViewMode::Details => {
+            if let Some(details) = &state.commit_details {
+                let date_str = chrono::DateTime::from_timestamp(details.date, 0)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "Unknown".to_string());
 
-        let content = format!(
-            "\n  Commit\n  {}\n\n  {}\n\n  Author: {}\n\n  Date: {}\n\n  Parent: {}\n\n  Files changed: {}\n\n  Insertions: +{}\n\n  Deletions: -{}",
-            details.oid.chars().take(7).collect::<String>(),
-            details.summary,
-            details.author,
-            date_str,
-            parent_str.chars().take(7).collect::<String>(),
-            details.files_changed,
-            details.insertions,
-            details.deletions
-        );
-        let details_text = Paragraph::new(content)
-            .block(details_block)
-            .scroll((state.details_scroll, 0));
-        f.render_widget(details_text, main_chunks[1]);
-    } else {
-        f.render_widget(details_block, main_chunks[1]);
+                let parent_str = if details.parents.is_empty() {
+                    "None".to_string()
+                } else {
+                    details.parents[0].clone()
+                };
+
+                let content = format!(
+                    "\n  Commit\n  {}\n\n  {}\n\n  Author:\n  {}\n\n  Date: {}\n\n  Parent: {}\n\n  Files changed: {}\n\n  Insertions:\n  +{}\n\n  Deletions:\n  -{}",
+                    details.oid.chars().take(7).collect::<String>(),
+                    details.summary,
+                    details.author,
+                    date_str,
+                    parent_str.chars().take(7).collect::<String>(),
+                    details.files_changed,
+                    details.insertions,
+                    details.deletions
+                );
+                let details_text = Paragraph::new(content)
+                    .block(details_block)
+                    .scroll((state.details_scroll, state.details_scroll_x));
+                f.render_widget(details_text, main_chunks[1]);
+            } else {
+                f.render_widget(details_block, main_chunks[1]);
+            }
+        }
+        crate::app::ViewMode::Files => {
+            let content = state.changed_files.join("\n");
+            let details_text = Paragraph::new(content)
+                .block(details_block)
+                .scroll((state.details_scroll, state.details_scroll_x));
+            f.render_widget(details_text, main_chunks[1]);
+        }
+        crate::app::ViewMode::Diff => {
+            use ratatui::style::{Color, Style};
+            use ratatui::text::{Line, Span};
+            let mut lines = Vec::new();
+            for line in &state.diff_lines {
+                if line.starts_with('+') {
+                    lines.push(Line::from(Span::styled(
+                        line.clone(),
+                        Style::default().fg(Color::Green),
+                    )));
+                } else if line.starts_with('-') {
+                    lines.push(Line::from(Span::styled(
+                        line.clone(),
+                        Style::default().fg(Color::Red),
+                    )));
+                } else if line.starts_with("@@") {
+                    lines.push(Line::from(Span::styled(
+                        line.clone(),
+                        Style::default().fg(Color::Cyan),
+                    )));
+                } else {
+                    lines.push(Line::from(line.clone()));
+                }
+            }
+            let details_text = Paragraph::new(lines)
+                .block(details_block)
+                .scroll((state.details_scroll, state.details_scroll_x));
+            f.render_widget(details_text, main_chunks[1]);
+        }
+        crate::app::ViewMode::Graph => {
+            f.render_widget(details_block, main_chunks[1]);
+        }
     }
 
     let bottom_block = Block::bordered();
-    let bottom_text = Paragraph::new(" ↑/↓ j/k Navigate   Enter Inspect   Esc Close   q Quit")
-        .block(bottom_block);
+    let bottom_text = Paragraph::new(" ↑/↓ j/k Navigate/Scroll   Enter Details   f Files   d Diff   Esc Close   q Quit").block(bottom_block);
     f.render_widget(bottom_text, chunks[2]);
 }

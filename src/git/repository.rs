@@ -132,4 +132,55 @@ impl GitRepository {
             deletions: stats.deletions(),
         })
     }
+
+    pub fn changed_files(&self, oid_str: &str) -> Result<Vec<String>, git2::Error> {
+        let oid = git2::Oid::from_str(oid_str)?;
+        let commit = self.repo.find_commit(oid)?;
+        let tree = commit.tree()?;
+        let parent_tree = if commit.parent_count() > 0 {
+            Some(commit.parent(0)?.tree()?)
+        } else {
+            None
+        };
+
+        let diff = self
+            .repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+        let mut files = Vec::new();
+        diff.print(git2::DiffFormat::NameOnly, |delta, _, _| {
+            if let Some(path) = delta.new_file().path() {
+                files.push(path.to_string_lossy().to_string());
+            }
+            true
+        })?;
+        Ok(files)
+    }
+
+    pub fn commit_diff(&self, oid_str: &str) -> Result<Vec<String>, git2::Error> {
+        let oid = git2::Oid::from_str(oid_str)?;
+        let commit = self.repo.find_commit(oid)?;
+        let tree = commit.tree()?;
+        let parent_tree = if commit.parent_count() > 0 {
+            Some(commit.parent(0)?.tree()?)
+        } else {
+            None
+        };
+
+        let diff = self
+            .repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+        let mut lines = Vec::new();
+        diff.print(git2::DiffFormat::Patch, |_, _, line| {
+            let origin = line.origin();
+            let content = String::from_utf8_lossy(line.content())
+                .trim_end_matches(&['\n', '\r'][..])
+                .to_string();
+            match origin {
+                '+' | '-' | ' ' => lines.push(format!("{}{}", origin, content)),
+                _ => lines.push(content),
+            }
+            true
+        })?;
+        Ok(lines)
+    }
 }
