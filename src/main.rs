@@ -53,13 +53,32 @@ where
             if app_state.view_mode != gitloom::app::ViewMode::Graph {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => app_state.close_details(),
-                    KeyCode::Char('j') | KeyCode::Down => app_state.scroll_details_down(),
-                    KeyCode::Char('k') | KeyCode::Up => app_state.scroll_details_up(),
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if app_state.view_mode == gitloom::app::ViewMode::Refs {
+                            app_state.scroll_refs_down();
+                        } else {
+                            app_state.scroll_details_down();
+                        }
+                    },
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        if app_state.view_mode == gitloom::app::ViewMode::Refs {
+                            app_state.scroll_refs_up();
+                        } else {
+                            app_state.scroll_details_up();
+                        }
+                    },
                     KeyCode::Right | KeyCode::Char('l') => app_state.scroll_details_right(),
                     KeyCode::Left | KeyCode::Char('h') => app_state.scroll_details_left(),
-                    KeyCode::Enter => app_state.load_details(),
+                    KeyCode::Enter => {
+                        if app_state.view_mode == gitloom::app::ViewMode::Refs {
+                            app_state.close_details();
+                        } else {
+                            app_state.load_details();
+                        }
+                    },
                     KeyCode::Char('f') => app_state.load_files(),
                     KeyCode::Char('d') => app_state.load_diff(),
+                    KeyCode::Char('b') => app_state.load_refs(),
                     _ => {}
                 }
             } else {
@@ -70,6 +89,7 @@ where
                     KeyCode::Enter => app_state.load_details(),
                     KeyCode::Char('f') => app_state.load_files(),
                     KeyCode::Char('d') => app_state.load_diff(),
+                    KeyCode::Char('b') => app_state.load_refs(),
                     _ => {}
                 }
             }

@@ -70,6 +70,7 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         crate::app::ViewMode::Files => "CHANGED FILES",
         crate::app::ViewMode::Diff => "DIFF",
         crate::app::ViewMode::Graph => "DETAILS AREA",
+        crate::app::ViewMode::Refs => "BRANCHES & TAGS",
     });
 
     match state.view_mode {
@@ -143,9 +144,43 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         crate::app::ViewMode::Graph => {
             f.render_widget(details_block, main_chunks[1]);
         }
+        crate::app::ViewMode::Refs => {
+            if let Some(refs) = &state.refs {
+                let mut items = Vec::new();
+                
+                use ratatui::style::{Style, Color, Modifier};
+                let header_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                let item_style = Style::default().fg(Color::White);
+
+                items.push(ListItem::new("Local Branches").style(header_style));
+                for branch in &refs.local_branches {
+                    items.push(ListItem::new(format!("  {}", branch)).style(item_style));
+                }
+
+                items.push(ListItem::new("Remote Branches").style(header_style));
+                for branch in &refs.remote_branches {
+                    items.push(ListItem::new(format!("  {}", branch)).style(item_style));
+                }
+
+                items.push(ListItem::new("Tags").style(header_style));
+                for tag in &refs.tags {
+                    items.push(ListItem::new(format!("  {}", tag)).style(item_style));
+                }
+
+                let list = List::new(items)
+                    .block(details_block)
+                    .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                
+                // clone state.refs_list_state since render_stateful_widget takes a mut ref
+                let mut list_state = state.refs_list_state;
+                f.render_stateful_widget(list, main_chunks[1], &mut list_state);
+            } else {
+                f.render_widget(details_block, main_chunks[1]);
+            }
+        }
     }
 
     let bottom_block = Block::bordered();
-    let bottom_text = Paragraph::new(" ↑/↓ j/k Navigate/Scroll   Enter Details   f Files   d Diff   Esc Close   q Quit").block(bottom_block);
+    let bottom_text = Paragraph::new(" ↑/↓ j/k Navigate/Scroll   Enter Details   f Files   d Diff   b Branches   Esc Close   q Quit").block(bottom_block);
     f.render_widget(bottom_text, chunks[2]);
 }

@@ -184,3 +184,38 @@ impl GitRepository {
         Ok(lines)
     }
 }
+
+pub struct RepoRefs {
+    pub local_branches: Vec<String>,
+    pub remote_branches: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+impl GitRepository {
+    pub fn refs(&self) -> Result<RepoRefs, git2::Error> {
+        let mut local_branches = Vec::new();
+        let mut remote_branches = Vec::new();
+        
+        for (b, _) in self.repo.branches(Some(git2::BranchType::Local))?.flatten() {
+            if let Ok(Some(name)) = b.name() {
+                local_branches.push(name.to_string());
+            }
+        }
+        
+        for (b, _) in self.repo.branches(Some(git2::BranchType::Remote))?.flatten() {
+            if let Ok(Some(name)) = b.name() {
+                remote_branches.push(name.to_string());
+            }
+        }
+        
+        let mut tags = Vec::new();
+        let tag_names = self.repo.tag_names(None)?;
+        for i in 0..tag_names.len() {
+            if let Ok(Some(name)) = tag_names.get(i) {
+                tags.push(name.to_string());
+            }
+        }
+        
+        Ok(RepoRefs { local_branches, remote_branches, tags })
+    }
+}

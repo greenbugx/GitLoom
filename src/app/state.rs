@@ -18,6 +18,7 @@ pub enum ViewMode {
     Details,
     Files,
     Diff,
+    Refs,
 }
 
 pub struct AppState {
@@ -32,6 +33,8 @@ pub struct AppState {
     pub view_mode: ViewMode,
     pub changed_files: Vec<String>,
     pub diff_lines: Vec<String>,
+    pub refs: Option<crate::git::repository::RepoRefs>,
+    pub refs_list_state: ListState,
 }
 
 impl Default for AppState {
@@ -88,6 +91,8 @@ impl AppState {
             view_mode: ViewMode::Graph,
             changed_files: Vec::new(),
             diff_lines: Vec::new(),
+            refs: None,
+            refs_list_state: ListState::default(),
         }
     }
 
@@ -148,6 +153,7 @@ impl AppState {
             ViewMode::Files => self.changed_files.len() as u16,
             ViewMode::Diff => self.diff_lines.len() as u16,
             ViewMode::Graph => 0,
+            ViewMode::Refs => 0,
         };
         let term_height = crossterm::terminal::size().map(|s| s.1).unwrap_or(24);
         let visible_height = term_height.saturating_sub(8);
@@ -176,6 +182,7 @@ impl AppState {
             ViewMode::Files => self.changed_files.iter().map(|s| s.len()).max().unwrap_or(0) as u16,
             ViewMode::Diff => self.diff_lines.iter().map(|s| s.len()).max().unwrap_or(0) as u16,
             ViewMode::Graph => 0,
+            ViewMode::Refs => 0,
         };
 
         let term_width = crossterm::terminal::size().map(|s| s.0).unwrap_or(80);
@@ -222,6 +229,41 @@ impl AppState {
             ViewMode::Details => self.load_details(),
             ViewMode::Files => self.load_files(),
             ViewMode::Diff => self.load_diff(),
+            ViewMode::Refs => {}, // Reloading refs not needed on every commit change
+        }
+    }
+
+    pub fn load_refs(&mut self) {
+        if let RepoState::Loaded(repo, _) = &self.repo_state
+            && let Ok(refs) = repo.refs()
+        {
+            self.refs = Some(refs);
+            self.view_mode = ViewMode::Refs;
+            self.refs_list_state.select(Some(0));
+        }
+    }
+
+    pub fn scroll_refs_down(&mut self) {
+        if let Some(refs) = &self.refs {
+            let total = refs.local_branches.len() + refs.remote_branches.len() + refs.tags.len() + 3;
+            if total == 0 { return; }
+            let i = match self.refs_list_state.selected() {
+                Some(i) => if i >= total - 1 { total - 1 } else { i + 1 },
+                None => 0,
+            };
+            self.refs_list_state.select(Some(i));
+        }
+    }
+
+    pub fn scroll_refs_up(&mut self) {
+        if let Some(refs) = &self.refs {
+            let total = refs.local_branches.len() + refs.remote_branches.len() + refs.tags.len() + 3;
+            if total == 0 { return; }
+            let i = match self.refs_list_state.selected() {
+                Some(i) => if i == 0 { 0 } else { i - 1 },
+                None => 0,
+            };
+            self.refs_list_state.select(Some(i));
         }
     }
 }
