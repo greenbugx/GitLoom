@@ -35,6 +35,10 @@ pub struct AppState {
     pub diff_lines: Vec<String>,
     pub refs: Option<crate::git::repository::RepoRefs>,
     pub refs_list_state: ListState,
+    pub search_query: String,
+    pub is_searching: bool,
+    pub search_results: Vec<usize>,
+    pub search_index: usize,
 }
 
 impl Default for AppState {
@@ -93,6 +97,10 @@ impl AppState {
             diff_lines: Vec::new(),
             refs: None,
             refs_list_state: ListState::default(),
+            search_query: String::new(),
+            is_searching: false,
+            search_results: Vec::new(),
+            search_index: 0,
         }
     }
 
@@ -264,6 +272,55 @@ impl AppState {
                 None => 0,
             };
             self.refs_list_state.select(Some(i));
+        }
+    }
+
+    pub fn start_search(&mut self) {
+        self.is_searching = true;
+        self.search_query.clear();
+    }
+
+    pub fn execute_search(&mut self) {
+        self.is_searching = false;
+        if self.search_query.is_empty() {
+            self.search_results.clear();
+            return;
+        }
+        
+        let q = self.search_query.to_lowercase();
+        self.search_results.clear();
+        for (i, commit) in self.commits.iter().enumerate() {
+            if commit.summary.to_lowercase().contains(&q) 
+                || commit.author.to_lowercase().contains(&q)
+                || commit.oid.to_lowercase().contains(&q) {
+                self.search_results.push(i);
+            }
+        }
+        
+        self.search_index = 0;
+        self.jump_to_current_search_result();
+    }
+
+    pub fn next_search_result(&mut self) {
+        if self.search_results.is_empty() { return; }
+        self.search_index = (self.search_index + 1) % self.search_results.len();
+        self.jump_to_current_search_result();
+    }
+
+    pub fn previous_search_result(&mut self) {
+        if self.search_results.is_empty() { return; }
+        if self.search_index == 0 {
+            self.search_index = self.search_results.len() - 1;
+        } else {
+            self.search_index -= 1;
+        }
+        self.jump_to_current_search_result();
+    }
+
+    fn jump_to_current_search_result(&mut self) {
+        if let Some(&idx) = self.search_results.get(self.search_index) {
+            self.list_state.select(Some(idx));
+            self.refresh_view();
         }
     }
 }

@@ -181,6 +181,16 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     }
 
     let bottom_block = Block::bordered();
-    let bottom_text = Paragraph::new(" ↑/↓ j/k Navigate/Scroll   Enter Details   f Files   d Diff   b Branches   Esc Close   q Quit").block(bottom_block);
+    
+    let bottom_text = if state.is_searching {
+        Paragraph::new(format!("/{}", state.search_query)).block(bottom_block)
+    } else if !state.search_results.is_empty() {
+        let text = format!(" ↑/↓ j/k Nav   Enter Details   f Files   d Diff   b Branches   / Search   n/N Match {}/{}   Esc Close   q Quit", 
+            state.search_index + 1, state.search_results.len());
+        Paragraph::new(text).block(bottom_block)
+    } else {
+        Paragraph::new(" ↑/↓ j/k Navigate/Scroll   Enter Details   f Files   d Diff   b Branches   / Search   Esc Close   q Quit").block(bottom_block)
+    };
+    
     f.render_widget(bottom_text, chunks[2]);
 }

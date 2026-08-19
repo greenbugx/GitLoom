@@ -50,6 +50,17 @@ where
             .map_err(|e| e.into())?;
 
         if let Event::Key(key) = event::read()? {
+            if app_state.is_searching {
+                match key.code {
+                    KeyCode::Esc => app_state.is_searching = false,
+                    KeyCode::Enter => app_state.execute_search(),
+                    KeyCode::Backspace => { app_state.search_query.pop(); },
+                    KeyCode::Char(c) => app_state.search_query.push(c),
+                    _ => {}
+                }
+                continue;
+            }
+
             if app_state.view_mode != gitloom::app::ViewMode::Graph {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => app_state.close_details(),
@@ -79,6 +90,9 @@ where
                     KeyCode::Char('f') => app_state.load_files(),
                     KeyCode::Char('d') => app_state.load_diff(),
                     KeyCode::Char('b') => app_state.load_refs(),
+                    KeyCode::Char('/') => app_state.start_search(),
+                    KeyCode::Char('n') => app_state.next_search_result(),
+                    KeyCode::Char('N') => app_state.previous_search_result(),
                     _ => {}
                 }
             } else {
@@ -90,6 +104,9 @@ where
                     KeyCode::Char('f') => app_state.load_files(),
                     KeyCode::Char('d') => app_state.load_diff(),
                     KeyCode::Char('b') => app_state.load_refs(),
+                    KeyCode::Char('/') => app_state.start_search(),
+                    KeyCode::Char('n') => app_state.next_search_result(),
+                    KeyCode::Char('N') => app_state.previous_search_result(),
                     _ => {}
                 }
             }
