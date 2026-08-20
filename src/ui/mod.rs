@@ -1,10 +1,19 @@
 use crate::app::{AppState, RepoState};
+use crate::git::repository::RefKind;
+use crate::graph::layout::lane_color;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, List, ListItem, Paragraph},
 };
+
+/// The highlight symbol shown on the selected graph row. Its width is reserved
+/// by the `List` for every row (blank for unselected rows), so it must stay in
+/// sync with `HIGHLIGHT_WIDTH` used to right-align the minimap.
+const HIGHLIGHT_SYMBOL: &str = ">> ";
+const HIGHLIGHT_WIDTH: usize = 3;
 
 pub fn render(f: &mut Frame, state: &mut AppState) {
     let vertical = Layout::vertical([
@@ -17,7 +26,7 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     let title_block = Block::bordered().title("GitLoom");
     f.render_widget(title_block, chunks[0]);
 
-    let horizontal = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]);
+    let horizontal = Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)]);
     let main_chunks = horizontal.split(chunks[1]);
 
     let graph_block = Block::bordered().title("GRAPH AREA");
@@ -43,13 +52,73 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         let graph_text = Paragraph::new(content).block(graph_block);
         f.render_widget(graph_text, main_chunks[0]);
     } else {
+        // Cap how much horizontal room the graph glyphs may take so a wide
+        // graph cannot crowd out the commit summaries. Lanes beyond this are
+        // not rendered in the UI (the full topology is still in the engine).
+        const MAX_GRAPH_LANES: usize = 24;
+        let inner_width =
+            (main_chunks[0].width.saturating_sub(2) as usize).saturating_sub(HIGHLIGHT_WIDTH);
         let items: Vec<ListItem> = state
             .commits
             .iter()
             .zip(state.graph_rows.iter())
-            .map(|(c, r)| {
-                let content = format!("{}  {}  {}", r.glyphs, c.short_oid(), c.summary);
-                ListItem::new(content)
+            .enumerate()
+            .map(|(i, (c, r))| {
+                let mut spans: Vec<Span> = Vec::new();
+                for seg in r.segments.iter().take(MAX_GRAPH_LANES) {
+                    let ch = seg.glyph.char();
+                    if ch == ' ' {
+                        spans.push(Span::raw(" "));
+                    } else {
+                        spans.push(Span::styled(
+                            ch.to_string(),
+                            Style::default().fg(lane_color(seg.lane)),
+                        ));
+                    }
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    c.short_oid(),
+                    Style::default().fg(Color::DarkGray),
+                ));
+
+                // Inline ref badges next to the commit summary: branches green,
+                // remote branches red, tags yellow.
+                if let Some(badges) = state.ref_map.get(&c.oid) {
+                    for badge in badges {
+                        let color = match badge.kind {
+                            RefKind::Local => Color::Green,
+                            RefKind::Remote => Color::Red,
+                            RefKind::Tag => Color::Yellow,
+                        };
+                        spans.push(Span::raw(" "));
+                        spans.push(Span::styled(
+                            badge.name.clone(),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                }
+
+                spans.push(Span::raw("  "));
+                spans.extend(style_summary(&c.summary));
+
+                let mut line = Line::from(spans);
+                if let Some(&ch) = state.minimap.get(i) {
+                    let content_width = line.width();
+                    // Reserve a right-aligned minimap column only when the row
+                    // fits; if it would push the commit summary past the edge,
+                    // yield to the summary instead (no extra truncation).
+                    let pad = inner_width.saturating_sub(content_width + 1);
+                    if pad > 0 {
+                        line.spans.push(Span::raw(" ".repeat(pad)));
+                        line.spans.push(Span::styled(
+                            ch.to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                }
+                ListItem::new(line)
             })
             .collect();
 
@@ -60,7 +129,7 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
                     .add_modifier(Modifier::BOLD)
                     .fg(Color::Yellow),
             )
-            .highlight_symbol(">> ");
+            .highlight_symbol(HIGHLIGHT_SYMBOL);
 
         f.render_stateful_widget(list, main_chunks[0], &mut state.list_state);
     }
@@ -147,9 +216,11 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         crate::app::ViewMode::Refs => {
             if let Some(refs) = &state.refs {
                 let mut items = Vec::new();
-                
-                use ratatui::style::{Style, Color, Modifier};
-                let header_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+
+                use ratatui::style::{Color, Modifier, Style};
+                let header_style = Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
                 let item_style = Style::default().fg(Color::White);
 
                 items.push(ListItem::new("Local Branches").style(header_style));
@@ -170,7 +241,7 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
                 let list = List::new(items)
                     .block(details_block)
                     .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
-                
+
                 // clone state.refs_list_state since render_stateful_widget takes a mut ref
                 let mut list_state = state.refs_list_state;
                 f.render_stateful_widget(list, main_chunks[1], &mut list_state);
@@ -181,16 +252,45 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     }
 
     let bottom_block = Block::bordered();
-    
+
     let bottom_text = if state.is_searching {
         Paragraph::new(format!("/{}", state.search_query)).block(bottom_block)
     } else if !state.search_results.is_empty() {
-        let text = format!(" ↑/↓ j/k Nav   Enter Details   f Files   d Diff   b Branches   / Search   n/N Match {}/{}   Esc Close   q Quit", 
-            state.search_index + 1, state.search_results.len());
+        let text = format!(
+            " ↑/↓ j/k Nav   Enter Details   f Files   d Diff   b Branches   / Search   n/N Match {}/{}   Esc Close   q Quit",
+            state.search_index + 1,
+            state.search_results.len()
+        );
         Paragraph::new(text).block(bottom_block)
     } else {
         Paragraph::new(" ↑/↓ j/k Navigate/Scroll   Enter Details   f Files   d Diff   b Branches   / Search   Esc Close   q Quit").block(bottom_block)
     };
-    
+
     f.render_widget(bottom_text, chunks[2]);
+}
+
+/// Color the conventional-commit prefix of a summary, leaving the rest plain:
+/// feat green, fix red, docs blue, chore gray, refactor magenta, test cyan.
+fn style_summary(summary: &str) -> Vec<Span<'static>> {
+    const PREFIXES: [(&str, Color); 6] = [
+        ("feat:", Color::Green),
+        ("fix:", Color::Red),
+        ("docs:", Color::Blue),
+        ("chore:", Color::DarkGray),
+        ("refactor:", Color::Magenta),
+        ("test:", Color::Cyan),
+    ];
+    for (prefix, color) in PREFIXES {
+        if summary.starts_with(prefix) {
+            let (prefix_part, rest) = summary.split_at(prefix.len());
+            return vec![
+                Span::styled(
+                    prefix_part.to_string(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(rest.to_string()),
+            ];
+        }
+    }
+    vec![Span::raw(summary.to_string())]
 }

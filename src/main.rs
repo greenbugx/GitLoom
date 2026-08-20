@@ -54,7 +54,9 @@ where
                 match key.code {
                     KeyCode::Esc => app_state.is_searching = false,
                     KeyCode::Enter => app_state.execute_search(),
-                    KeyCode::Backspace => { app_state.search_query.pop(); },
+                    KeyCode::Backspace => {
+                        app_state.search_query.pop();
+                    }
                     KeyCode::Char(c) => app_state.search_query.push(c),
                     _ => {}
                 }
@@ -70,14 +72,14 @@ where
                         } else {
                             app_state.scroll_details_down();
                         }
-                    },
+                    }
                     KeyCode::Char('k') | KeyCode::Up => {
                         if app_state.view_mode == gitloom::app::ViewMode::Refs {
                             app_state.scroll_refs_up();
                         } else {
                             app_state.scroll_details_up();
                         }
-                    },
+                    }
                     KeyCode::Right | KeyCode::Char('l') => app_state.scroll_details_right(),
                     KeyCode::Left | KeyCode::Char('h') => app_state.scroll_details_left(),
                     KeyCode::Enter => {
@@ -86,7 +88,7 @@ where
                         } else {
                             app_state.load_details();
                         }
-                    },
+                    }
                     KeyCode::Char('f') => app_state.load_files(),
                     KeyCode::Char('d') => app_state.load_diff(),
                     KeyCode::Char('b') => app_state.load_refs(),
