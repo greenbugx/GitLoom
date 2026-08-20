@@ -21,10 +21,11 @@ fn test_linear_history() {
     ];
 
     let rows = GraphEngine::build(&commits);
-    assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0].glyphs, "●");
-    assert_eq!(rows[1].glyphs, "●");
-    assert_eq!(rows[2].glyphs, "●");
+    // Strict 1-row-per-commit data model: no spacer rows.
+    assert_eq!(rows.len(), commits.len());
+    assert_eq!(rows[0].render_plain(), "●");
+    assert_eq!(rows[1].render_plain(), "●");
+    assert_eq!(rows[2].render_plain(), "●");
 }
 
 #[test]
@@ -43,10 +44,11 @@ fn test_one_branch() {
     ];
 
     let rows = GraphEngine::build(&commits);
-    assert_eq!(rows[0].glyphs, "●");
-    assert_eq!(rows[1].glyphs, "● │");
-    assert_eq!(rows[2].glyphs, "│ ●");
-    assert_eq!(rows[3].glyphs, "●");
+    assert_eq!(rows.len(), commits.len());
+    assert_eq!(rows[0].render_plain(), "●");
+    assert_eq!(rows[1].render_plain(), "● │");
+    assert_eq!(rows[2].render_plain(), "│ ●");
+    assert_eq!(rows[3].render_plain(), "●");
 }
 
 #[test]
@@ -58,10 +60,11 @@ fn test_one_merge() {
         make_commit("1", &[]),
     ];
     let rows = GraphEngine::build(&commits);
-    assert_eq!(rows[0].glyphs, "●");
-    assert_eq!(rows[1].glyphs, "● │");
-    assert_eq!(rows[2].glyphs, "│ ●");
-    assert_eq!(rows[3].glyphs, "●");
+    assert_eq!(rows.len(), commits.len());
+    assert_eq!(rows[0].render_plain(), "●");
+    assert_eq!(rows[1].render_plain(), "● │");
+    assert_eq!(rows[2].render_plain(), "│ ●");
+    assert_eq!(rows[3].render_plain(), "●");
 }
 
 #[test]
@@ -75,12 +78,13 @@ fn test_multiple_branches() {
         make_commit("0", &[]),
     ];
     let rows = GraphEngine::build(&commits);
-    assert_eq!(rows[0].glyphs, "●");
-    assert_eq!(rows[1].glyphs, "● │");
-    assert_eq!(rows[2].glyphs, "│ ●");
-    assert_eq!(rows[3].glyphs, "│ │ ●");
-    assert_eq!(rows[4].glyphs, "│ ●");
-    assert_eq!(rows[5].glyphs, "●");
+    assert_eq!(rows.len(), commits.len());
+    assert_eq!(rows[0].render_plain(), "●");
+    assert_eq!(rows[1].render_plain(), "● │");
+    assert_eq!(rows[2].render_plain(), "│ ●");
+    assert_eq!(rows[3].render_plain(), "│ │ ●");
+    assert_eq!(rows[4].render_plain(), "│ ●");
+    assert_eq!(rows[5].render_plain(), "●");
 }
 
 #[test]
@@ -92,11 +96,11 @@ fn test_branch_creation_and_termination() {
         make_commit("1", &[]),
     ];
     let rows = GraphEngine::build(&commits);
-    assert_eq!(rows.len(), 4);
-    assert_eq!(rows[0].glyphs, "●");
-    assert_eq!(rows[1].glyphs, "●");
-    assert_eq!(rows[2].glyphs, "│ ●");
-    assert_eq!(rows[3].glyphs, "●");
+    assert_eq!(rows.len(), commits.len());
+    assert_eq!(rows[0].render_plain(), "●");
+    assert_eq!(rows[1].render_plain(), "●");
+    assert_eq!(rows[2].render_plain(), "│ ●");
+    assert_eq!(rows[3].render_plain(), "●");
 }
 
 #[test]
@@ -110,5 +114,11 @@ fn test_complicated_merge_topology() {
         make_commit("1", &[]),
     ];
     let rows = GraphEngine::build(&commits);
-    assert_eq!(rows.len(), 6);
+    assert_eq!(rows.len(), commits.len());
+    assert_eq!(rows[0].render_plain(), "●");
+    assert_eq!(rows[1].render_plain(), "● │");
+    assert_eq!(rows[2].render_plain(), "│ ●");
+    assert_eq!(rows[3].render_plain(), "● │");
+    assert_eq!(rows[4].render_plain(), "│ ●");
+    assert_eq!(rows[5].render_plain(), "●");
 }

@@ -1,6 +1,7 @@
 use crate::git::commit::CommitInfo;
-use crate::git::repository::{GitRepository, RepoInfo};
+use crate::git::repository::{GitRepository, RefBadge, RepoInfo};
 use ratatui::widgets::ListState;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::git::commit::CommitDetails;
@@ -39,6 +40,12 @@ pub struct AppState {
     pub is_searching: bool,
     pub search_results: Vec<usize>,
     pub search_index: usize,
+    /// Point-in-time OID -> ref badges snapshot, loaded once at init.
+    /// `GitRepository::ref_map` is NOT live and must be rebuilt if a
+    /// future refresh/reload command is added.
+    pub ref_map: HashMap<String, Vec<RefBadge>>,
+    /// Precomputed minimap sparkline char per commit (indexed by commit order).
+    pub minimap: Vec<char>,
 }
 
 impl Default for AppState {
@@ -55,6 +62,8 @@ impl AppState {
         let mut commits = Vec::new();
         let mut graph_rows = Vec::new();
         let mut list_state = ListState::default();
+        let mut ref_map: HashMap<String, Vec<RefBadge>> = HashMap::new();
+        let mut minimap: Vec<char> = Vec::new();
 
         let repo_state = match GitRepository::open(&search_path) {
             Ok(repo) => {
@@ -63,18 +72,19 @@ impl AppState {
                     commits = loaded_commits;
                     graph_rows = GraphEngine::build(&commits);
 
-                    let max_width = graph_rows
+                    // Minimap values are normalized against ALL loaded commits
+                    // and computed exactly once at load, not per scroll frame.
+                    // Tradeoff (accepted): one outsized commit flattens the rest of the scale
+                    // recomputing per-viewport on every scroll
+                    // tick is not worth the complexity.
+                    let deltas = repo.commit_deltas(&commits);
+                    let max_delta = deltas.iter().map(|(i, d)| i + d).max().unwrap_or(0);
+                    minimap = deltas
                         .iter()
-                        .map(|r| r.glyphs.chars().count())
-                        .max()
-                        .unwrap_or(0);
-                    for row in &mut graph_rows {
-                        let current_len = row.glyphs.chars().count();
-                        if current_len < max_width {
-                            row.glyphs.push_str(&" ".repeat(max_width - current_len));
-                        }
-                    }
+                        .map(|(i, d)| sparkline_char(i + d, max_delta))
+                        .collect();
                 }
+                ref_map = repo.ref_map().unwrap_or_default();
                 if !commits.is_empty() {
                     list_state.select(Some(0));
                 }
@@ -101,6 +111,8 @@ impl AppState {
             is_searching: false,
             search_results: Vec::new(),
             search_index: 0,
+            ref_map,
+            minimap,
         }
     }
 
@@ -155,14 +167,42 @@ impl AppState {
         self.view_mode = ViewMode::Graph;
     }
 
+    /// Content dimensions of the details pane for the current view mode, as
+    /// `(number_of_lines, widest_line_width)`.
+    //  Used by both vertical and horizontal detail scrolling
+    /// so the two view-mode match arms are not duplicated.
+    fn content_dimensions(&self) -> (u16, u16) {
+        match self.view_mode {
+            ViewMode::Details => {
+                if let Some(details) = &self.commit_details {
+                    let lines = 30u16;
+                    let mut max_len = 0usize;
+                    max_len = max_len.max(details.summary.len());
+                    max_len = max_len.max(details.author.len());
+                    max_len = max_len.max(details.oid.len() + 2);
+                    (lines, max_len as u16)
+                } else {
+                    (0, 0)
+                }
+            }
+            ViewMode::Files => (
+                self.changed_files.len() as u16,
+                self.changed_files
+                    .iter()
+                    .map(|s| s.len())
+                    .max()
+                    .unwrap_or(0) as u16,
+            ),
+            ViewMode::Diff => (
+                self.diff_lines.len() as u16,
+                self.diff_lines.iter().map(|s| s.len()).max().unwrap_or(0) as u16,
+            ),
+            ViewMode::Graph | ViewMode::Refs => (0, 0),
+        }
+    }
+
     pub fn scroll_details_down(&mut self) {
-        let max_content_lines: u16 = match self.view_mode {
-            ViewMode::Details => 30,
-            ViewMode::Files => self.changed_files.len() as u16,
-            ViewMode::Diff => self.diff_lines.len() as u16,
-            ViewMode::Graph => 0,
-            ViewMode::Refs => 0,
-        };
+        let (max_content_lines, _) = self.content_dimensions();
         let term_height = crossterm::terminal::size().map(|s| s.1).unwrap_or(24);
         let visible_height = term_height.saturating_sub(8);
         let max_scroll = max_content_lines.saturating_sub(visible_height);
@@ -175,23 +215,7 @@ impl AppState {
     }
 
     pub fn scroll_details_right(&mut self) {
-        let max_line_len: u16 = match self.view_mode {
-            ViewMode::Details => {
-                if let Some(details) = &self.commit_details {
-                    let mut max_len = 0;
-                    max_len = max_len.max(details.summary.len());
-                    max_len = max_len.max(details.author.len());
-                    max_len = max_len.max(details.oid.len() + 2);
-                    max_len as u16
-                } else {
-                    0
-                }
-            },
-            ViewMode::Files => self.changed_files.iter().map(|s| s.len()).max().unwrap_or(0) as u16,
-            ViewMode::Diff => self.diff_lines.iter().map(|s| s.len()).max().unwrap_or(0) as u16,
-            ViewMode::Graph => 0,
-            ViewMode::Refs => 0,
-        };
+        let (_, max_line_len) = self.content_dimensions();
 
         let term_width = crossterm::terminal::size().map(|s| s.0).unwrap_or(80);
         let visible_width = (term_width * 30 / 100).saturating_sub(2);
@@ -237,7 +261,7 @@ impl AppState {
             ViewMode::Details => self.load_details(),
             ViewMode::Files => self.load_files(),
             ViewMode::Diff => self.load_diff(),
-            ViewMode::Refs => {}, // Reloading refs not needed on every commit change
+            ViewMode::Refs => {} // Reloading refs not needed on every commit change
         }
     }
 
@@ -253,10 +277,19 @@ impl AppState {
 
     pub fn scroll_refs_down(&mut self) {
         if let Some(refs) = &self.refs {
-            let total = refs.local_branches.len() + refs.remote_branches.len() + refs.tags.len() + 3;
-            if total == 0 { return; }
+            let total =
+                refs.local_branches.len() + refs.remote_branches.len() + refs.tags.len() + 3;
+            if total == 0 {
+                return;
+            }
             let i = match self.refs_list_state.selected() {
-                Some(i) => if i >= total - 1 { total - 1 } else { i + 1 },
+                Some(i) => {
+                    if i >= total - 1 {
+                        total - 1
+                    } else {
+                        i + 1
+                    }
+                }
                 None => 0,
             };
             self.refs_list_state.select(Some(i));
@@ -265,10 +298,19 @@ impl AppState {
 
     pub fn scroll_refs_up(&mut self) {
         if let Some(refs) = &self.refs {
-            let total = refs.local_branches.len() + refs.remote_branches.len() + refs.tags.len() + 3;
-            if total == 0 { return; }
+            let total =
+                refs.local_branches.len() + refs.remote_branches.len() + refs.tags.len() + 3;
+            if total == 0 {
+                return;
+            }
             let i = match self.refs_list_state.selected() {
-                Some(i) => if i == 0 { 0 } else { i - 1 },
+                Some(i) => {
+                    if i == 0 {
+                        0
+                    } else {
+                        i - 1
+                    }
+                }
                 None => 0,
             };
             self.refs_list_state.select(Some(i));
@@ -286,29 +328,34 @@ impl AppState {
             self.search_results.clear();
             return;
         }
-        
+
         let q = self.search_query.to_lowercase();
         self.search_results.clear();
         for (i, commit) in self.commits.iter().enumerate() {
-            if commit.summary.to_lowercase().contains(&q) 
+            if commit.summary.to_lowercase().contains(&q)
                 || commit.author.to_lowercase().contains(&q)
-                || commit.oid.to_lowercase().contains(&q) {
+                || commit.oid.to_lowercase().contains(&q)
+            {
                 self.search_results.push(i);
             }
         }
-        
+
         self.search_index = 0;
         self.jump_to_current_search_result();
     }
 
     pub fn next_search_result(&mut self) {
-        if self.search_results.is_empty() { return; }
+        if self.search_results.is_empty() {
+            return;
+        }
         self.search_index = (self.search_index + 1) % self.search_results.len();
         self.jump_to_current_search_result();
     }
 
     pub fn previous_search_result(&mut self) {
-        if self.search_results.is_empty() { return; }
+        if self.search_results.is_empty() {
+            return;
+        }
         if self.search_index == 0 {
             self.search_index = self.search_results.len() - 1;
         } else {
@@ -323,4 +370,14 @@ impl AppState {
             self.refresh_view();
         }
     }
+}
+
+const SPARKLINE_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+fn sparkline_char(value: usize, max: usize) -> char {
+    if max == 0 {
+        return SPARKLINE_CHARS[0];
+    }
+    let level = (value * 8).saturating_div(max).min(7);
+    SPARKLINE_CHARS[level]
 }
