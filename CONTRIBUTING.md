@@ -7,7 +7,7 @@ First off, thank you for considering contributing to GitLoom! It's people like y
 1. Make sure you have [Rust](https://rustup.rs/) installed.
 2. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/GitLoom.git
+   git clone https://github.com/greenbugx/GitLoom.git
    cd GitLoom
    ```
 3. Run the tests to ensure everything is working:
