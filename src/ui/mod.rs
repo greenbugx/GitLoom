@@ -1,3 +1,5 @@
+mod loading;
+
 use crate::app::{AppState, RepoState};
 use crate::git::repository::RefKind;
 use crate::graph::layout::lane_color;
@@ -32,25 +34,30 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     let graph_block = Block::bordered().title("GRAPH AREA");
 
     if state.commits.is_empty() {
-        let content = match &state.repo_state {
-            RepoState::None => "\n  No repository loaded".to_string(),
-            RepoState::Error(err) => format!("\n  Error: {}", err),
-            RepoState::Loaded(_, info) => {
-                if info.is_bare {
-                    format!("\n  Repository\n  {}\n\n  Bare repository", info.name)
-                } else {
-                    format!(
-                        "\n  Repository\n  {}\n\n  Branch\n  {}\n\n  Status\n  {}",
-                        info.name,
-                        info.branch,
-                        if info.is_clean { "Clean" } else { "Dirty" }
-                    )
+        if let Some(load) = &state.loading {
+            loading::render(f, main_chunks[0], graph_block, load);
+        } else {
+            let content = match &state.repo_state {
+                RepoState::None => "\n  No repository loaded".to_string(),
+                RepoState::Error(err) => format!("\n  Error: {}", err),
+                RepoState::Loading(_) => "\n  Opening repository...".to_string(),
+                RepoState::Loaded(_, info) => {
+                    if info.is_bare {
+                        format!("\n  Repository\n  {}\n\n  Bare repository", info.name)
+                    } else {
+                        format!(
+                            "\n  Repository\n  {}\n\n  Branch\n  {}\n\n  Status\n  {}",
+                            info.name,
+                            info.branch,
+                            if info.is_clean { "Clean" } else { "Dirty" }
+                        )
+                    }
                 }
-            }
-        };
+            };
 
-        let graph_text = Paragraph::new(content).block(graph_block);
-        f.render_widget(graph_text, main_chunks[0]);
+            let graph_text = Paragraph::new(content).block(graph_block);
+            f.render_widget(graph_text, main_chunks[0]);
+        }
     } else {
         // Cap how much horizontal room the graph glyphs may take so a wide
         // graph cannot crowd out the commit summaries. Lanes beyond this are
@@ -255,6 +262,8 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
 
     let bottom_text = if state.is_searching {
         Paragraph::new(format!("/{}", state.search_query)).block(bottom_block)
+    } else if let Some(load) = &state.loading {
+        Paragraph::new(loading::status_line(load)).block(bottom_block)
     } else if !state.search_results.is_empty() {
         let text = format!(
             " ↑/↓ j/k Nav   Enter Details   f Files   d Diff   b Branches   / Search   n/N Match {}/{}   Esc Close   q Quit",
