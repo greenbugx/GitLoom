@@ -1,15 +1,18 @@
+use crate::app::loading::{self, LoadMessage, LoadingState};
 use crate::git::commit::CommitInfo;
 use crate::git::repository::{GitRepository, RefBadge, RepoInfo};
 use ratatui::widgets::ListState;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use crate::git::commit::CommitDetails;
-use crate::graph::layout::{GraphEngine, GraphRow};
+use crate::graph::layout::GraphRow;
 
 pub enum RepoState {
     None,
     Error(String),
+    Loading(GitRepository),
     Loaded(GitRepository, RepoInfo),
 }
 
@@ -45,7 +48,12 @@ pub struct AppState {
     /// future refresh/reload command is added.
     pub ref_map: HashMap<String, Vec<RefBadge>>,
     /// Precomputed minimap sparkline char per commit (indexed by commit order).
+    /// Arrives together with the commits, so it is only empty without history.
     pub minimap: Vec<char>,
+    /// Progress of the background load; `None` when nothing is loading.
+    pub loading: Option<LoadingState>,
+    /// Progress channel from the loading thread, dropped when the load ends.
+    load_rx: Option<Receiver<LoadMessage>>,
 }
 
 impl Default for AppState {
@@ -59,46 +67,26 @@ impl AppState {
         let search_path =
             path.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        let mut commits = Vec::new();
-        let mut graph_rows = Vec::new();
-        let mut list_state = ListState::default();
-        let mut ref_map: HashMap<String, Vec<RefBadge>> = HashMap::new();
-        let mut minimap: Vec<char> = Vec::new();
-
-        let repo_state = match GitRepository::open(&search_path) {
+        let (repo_state, loading, load_rx) = match GitRepository::open(&search_path) {
             Ok(repo) => {
-                let info = repo.info();
-                if let Ok(loaded_commits) = repo.commits(1000) {
-                    commits = loaded_commits;
-                    graph_rows = GraphEngine::build(&commits);
-
-                    // Minimap values are normalized against ALL loaded commits
-                    // and computed exactly once at load, not per scroll frame.
-                    // Tradeoff (accepted): one outsized commit flattens the rest of the scale
-                    // recomputing per-viewport on every scroll
-                    // tick is not worth the complexity.
-                    let deltas = repo.commit_deltas(&commits);
-                    let max_delta = deltas.iter().map(|(i, d)| i + d).max().unwrap_or(0);
-                    minimap = deltas
-                        .iter()
-                        .map(|(i, d)| sparkline_char(i + d, max_delta))
-                        .collect();
-                }
-                ref_map = repo.ref_map().unwrap_or_default();
-                if !commits.is_empty() {
-                    list_state.select(Some(0));
-                }
-                RepoState::Loaded(repo, info)
+                let git_dir = repo.path();
+                let load_rx = loading::spawn(git_dir.clone());
+                let label = repo_label(&git_dir, &search_path);
+                (
+                    RepoState::Loading(repo),
+                    Some(LoadingState::new(label)),
+                    Some(load_rx),
+                )
             }
-            Err(e) => RepoState::Error(e.message().to_string()),
+            Err(e) => (RepoState::Error(e.message().to_string()), None, None),
         };
 
         Self {
             quit: false,
             repo_state,
-            commits,
-            graph_rows,
-            list_state,
+            commits: Vec::new(),
+            graph_rows: Vec::new(),
+            list_state: ListState::default(),
             commit_details: None,
             details_scroll: 0,
             details_scroll_x: 0,
@@ -111,8 +99,88 @@ impl AppState {
             is_searching: false,
             search_results: Vec::new(),
             search_index: 0,
-            ref_map,
-            minimap,
+            ref_map: HashMap::new(),
+            minimap: Vec::new(),
+            loading,
+            load_rx,
+        }
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.loading.is_some()
+    }
+
+    pub fn tick(&mut self) {
+        if let Some(load) = &mut self.loading {
+            load.tick();
+        }
+    }
+
+    pub fn poll_load(&mut self) {
+        let Some(rx) = &self.load_rx else {
+            return;
+        };
+
+        let mut messages = Vec::new();
+        let mut finished = false;
+        loop {
+            match rx.try_recv() {
+                Ok(message) => messages.push(message),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+
+        for message in messages {
+            self.apply(message);
+        }
+
+        if finished {
+            self.load_rx = None;
+            self.loading = None;
+            if matches!(self.repo_state, RepoState::Loading(_)) {
+                self.repo_state = RepoState::Error("failed to read repository".to_string());
+            }
+        }
+    }
+
+    fn apply(&mut self, message: LoadMessage) {
+        match message {
+            LoadMessage::Stage(stage) => {
+                if let Some(load) = &mut self.loading {
+                    load.set_stage(stage);
+                }
+            }
+            LoadMessage::Progress { done, total } => {
+                if let Some(load) = &mut self.loading {
+                    load.done = done;
+                    load.total = total;
+                }
+            }
+            LoadMessage::Ready(data) => {
+                let data = *data;
+                self.commits = data.commits;
+                self.graph_rows = data.graph_rows;
+                self.ref_map = data.ref_map;
+                self.minimap = data.minimap;
+                if !self.commits.is_empty() {
+                    self.list_state.select(Some(0));
+                }
+                let previous = std::mem::replace(&mut self.repo_state, RepoState::None);
+                self.repo_state = match previous {
+                    RepoState::Loading(repo) => RepoState::Loaded(repo, data.info),
+                    other => other,
+                };
+                self.loading = None;
+            }
+            LoadMessage::Failed(err) => {
+                self.repo_state = RepoState::Error(err);
+                self.loading = None;
+                self.load_rx = None;
+            }
         }
     }
 
@@ -372,12 +440,11 @@ impl AppState {
     }
 }
 
-const SPARKLINE_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-fn sparkline_char(value: usize, max: usize) -> char {
-    if max == 0 {
-        return SPARKLINE_CHARS[0];
-    }
-    let level = (value * 8).saturating_div(max).min(7);
-    SPARKLINE_CHARS[level]
+fn repo_label(git_dir: &Path, search_path: &Path) -> String {
+    git_dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .or_else(|| git_dir.file_name())
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| search_path.display().to_string())
 }
