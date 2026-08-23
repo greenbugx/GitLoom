@@ -1,3 +1,4 @@
+pub mod details_text;
 pub mod loading;
 pub mod state;
 

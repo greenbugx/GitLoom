@@ -220,6 +220,41 @@ pub struct RepoRefs {
     pub tags: Vec<String>,
 }
 
+/// A single row of the flattened refs pane: either a section header or a
+/// selectable branch/tag entry. Flattening once at load time means the
+/// selectable-row count lives in one place instead of being
+/// recomputed as `local + remote + tags + 3` wherever the
+/// refs pane is scrolled or rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefRow {
+    Header(&'static str),
+    Entry(String),
+}
+
+impl RefRow {
+    pub fn is_header(&self) -> bool {
+        matches!(self, RefRow::Header(_))
+    }
+}
+
+impl RepoRefs {
+    /// Flatten into display rows: a header followed by its entries, per
+    /// section, in `Local Branches / Remote Branches / Tags` order. Empty
+    /// sections still get a header row so the pane layout is stable.
+    pub fn rows(&self) -> Vec<RefRow> {
+        let mut rows = Vec::with_capacity(
+            self.local_branches.len() + self.remote_branches.len() + self.tags.len() + 3,
+        );
+        rows.push(RefRow::Header("Local Branches"));
+        rows.extend(self.local_branches.iter().cloned().map(RefRow::Entry));
+        rows.push(RefRow::Header("Remote Branches"));
+        rows.extend(self.remote_branches.iter().cloned().map(RefRow::Entry));
+        rows.push(RefRow::Header("Tags"));
+        rows.extend(self.tags.iter().cloned().map(RefRow::Entry));
+        rows
+    }
+}
+
 /// The kind of a ref badge shown inline next to a commit summary
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefKind {

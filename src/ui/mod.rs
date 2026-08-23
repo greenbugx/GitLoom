@@ -1,7 +1,8 @@
 mod loading;
 
+use crate::app::details_text;
 use crate::app::{AppState, RepoState};
-use crate::git::repository::RefKind;
+use crate::git::repository::{RefKind, RefRow};
 use crate::graph::layout::lane_color;
 use ratatui::{
     Frame,
@@ -149,34 +150,19 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         crate::app::ViewMode::Refs => "BRANCHES & TAGS",
     });
 
+    // Record the pane's real inner area (post-border) so `AppState`'s scroll
+    // clamping reads actual rendered geometry instead of re-deriving it from
+    // terminal size and the layout percentages above.
+    state.details_pane = details_block.inner(main_chunks[1]);
+
     match state.view_mode {
         crate::app::ViewMode::Details => {
             if let Some(details) = &state.commit_details {
-                let date_str = chrono::DateTime::from_timestamp(details.date, 0)
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                    .unwrap_or_else(|| "Unknown".to_string());
-
-                let parent_str = if details.parents.is_empty() {
-                    "None".to_string()
-                } else {
-                    details.parents[0].clone()
-                };
-
-                let content = format!(
-                    "\n  Commit\n  {}\n\n  {}\n\n  Author:\n  {}\n\n  Date: {}\n\n  Parent: {}\n\n  Files changed: {}\n\n  Insertions:\n  +{}\n\n  Deletions:\n  -{}",
-                    details.oid.chars().take(7).collect::<String>(),
-                    details.summary,
-                    details.author,
-                    date_str,
-                    parent_str.chars().take(7).collect::<String>(),
-                    details.files_changed,
-                    details.insertions,
-                    details.deletions
-                );
-                let details_text = Paragraph::new(content)
+                let content = details_text::format(details);
+                let details_para = Paragraph::new(content)
                     .block(details_block)
                     .scroll((state.details_scroll, state.details_scroll_x));
-                f.render_widget(details_text, main_chunks[1]);
+                f.render_widget(details_para, main_chunks[1]);
             } else {
                 f.render_widget(details_block, main_chunks[1]);
             }
@@ -190,7 +176,6 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         }
         crate::app::ViewMode::Diff => {
             use ratatui::style::{Color, Style};
-            use ratatui::text::{Line, Span};
             let mut lines = Vec::new();
             for line in &state.diff_lines {
                 if line.starts_with('+') {
@@ -221,30 +206,25 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
             f.render_widget(details_block, main_chunks[1]);
         }
         crate::app::ViewMode::Refs => {
-            if let Some(refs) = &state.refs {
-                let mut items = Vec::new();
-
+            if state.refs.is_some() {
                 use ratatui::style::{Color, Modifier, Style};
                 let header_style = Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD);
                 let item_style = Style::default().fg(Color::White);
 
-                items.push(ListItem::new("Local Branches").style(header_style));
-                for branch in &refs.local_branches {
-                    items.push(ListItem::new(format!("  {}", branch)).style(item_style));
-                }
-
-                items.push(ListItem::new("Remote Branches").style(header_style));
-                for branch in &refs.remote_branches {
-                    items.push(ListItem::new(format!("  {}", branch)).style(item_style));
-                }
-
-                items.push(ListItem::new("Tags").style(header_style));
-                for tag in &refs.tags {
-                    items.push(ListItem::new(format!("  {}", tag)).style(item_style));
-                }
-
+                let items: Vec<ListItem> = state
+                    .refs_rows
+                    .iter()
+                    .map(|row| match row {
+                        RefRow::Header(title) => {
+                            ListItem::new(title.to_string()).style(header_style)
+                        }
+                        RefRow::Entry(name) => {
+                            ListItem::new(format!("  {}", name)).style(item_style)
+                        }
+                    })
+                    .collect();
                 let list = List::new(items)
                     .block(details_block)
                     .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
@@ -264,6 +244,12 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         Paragraph::new(format!("/{}", state.search_query)).block(bottom_block)
     } else if let Some(load) = &state.loading {
         Paragraph::new(loading::status_line(load)).block(bottom_block)
+    } else if let Some(status) = &state.status {
+        // Surfaces the failure a load_* call swallowed instead of leaving the
+        // key press looking like a no-op.
+        Paragraph::new(format!(" {}", status))
+            .style(Style::default().fg(Color::Red))
+            .block(bottom_block)
     } else if !state.search_results.is_empty() {
         let text = format!(
             " ↑/↓ j/k Nav   Enter Details   f Files   d Diff   b Branches   / Search   n/N Match {}/{}   Esc Close   q Quit",

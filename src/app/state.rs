@@ -1,10 +1,12 @@
 use crate::app::loading::{self, LoadMessage, LoadingState};
 use crate::git::commit::CommitInfo;
-use crate::git::repository::{GitRepository, RefBadge, RepoInfo};
+use crate::git::repository::{GitRepository, RefBadge, RefRow, RepoInfo};
+use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use unicode_width::UnicodeWidthStr;
 
 use crate::git::commit::CommitDetails;
 use crate::graph::layout::GraphRow;
@@ -16,7 +18,7 @@ pub enum RepoState {
     Loaded(GitRepository, RepoInfo),
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 pub enum ViewMode {
     Graph,
     Details,
@@ -38,6 +40,10 @@ pub struct AppState {
     pub changed_files: Vec<String>,
     pub diff_lines: Vec<String>,
     pub refs: Option<crate::git::repository::RepoRefs>,
+    /// `refs` flattened into header/entry rows, rebuilt whenever `refs` is.
+    /// Scrolling and rendering both walk this instead of recomputing
+    /// `local + remote + tags + 3` and re-deriving header positions.
+    pub refs_rows: Vec<RefRow>,
     pub refs_list_state: ListState,
     pub search_query: String,
     pub is_searching: bool,
@@ -54,6 +60,13 @@ pub struct AppState {
     pub loading: Option<LoadingState>,
     /// Progress channel from the loading thread, dropped when the load ends.
     load_rx: Option<Receiver<LoadMessage>>,
+    /// Last-rendered inner area of the details/files/diff/refs pane, updated
+    /// by `ui::render` every frame. Scroll clamping reads real geometry from
+    /// here instead of re-deriving it from `crossterm::terminal::size()` and
+    /// the layout percentages baked into `ui::mod`.
+    pub details_pane: Rect,
+    /// Short status/error message shown in the bottom bar.
+    pub status: Option<String>,
 }
 
 impl Default for AppState {
@@ -94,6 +107,7 @@ impl AppState {
             changed_files: Vec::new(),
             diff_lines: Vec::new(),
             refs: None,
+            refs_rows: Vec::new(),
             refs_list_state: ListState::default(),
             search_query: String::new(),
             is_searching: false,
@@ -103,6 +117,8 @@ impl AppState {
             minimap: Vec::new(),
             loading,
             load_rx,
+            details_pane: Rect::default(),
+            status: None,
         }
     }
 
@@ -188,66 +204,60 @@ impl AppState {
         if self.commits.is_empty() {
             return;
         }
-        let i = match self.list_state.selected() {
-            Some(i) => {
-                if i >= self.commits.len() - 1 {
-                    self.commits.len() - 1
-                } else {
-                    i + 1
-                }
-            }
-            None => 0,
-        };
-        self.list_state.select(Some(i));
+        step_selection(&mut self.list_state, self.commits.len(), 1);
     }
 
     pub fn previous_commit(&mut self) {
         if self.commits.is_empty() {
             return;
         }
-        let i = match self.list_state.selected() {
-            Some(i) => {
-                if i == 0 {
-                    0
-                } else {
-                    i - 1
-                }
-            }
-            None => 0,
-        };
-        self.list_state.select(Some(i));
+        step_selection(&mut self.list_state, self.commits.len(), -1);
     }
 
     pub fn load_details(&mut self) {
-        if let Some(idx) = self.list_state.selected()
-            && let Some(commit) = self.commits.get(idx)
-            && let RepoState::Loaded(repo, _) = &self.repo_state
-            && let Ok(details) = repo.commit_details(&commit.oid)
-        {
-            self.commit_details = Some(details);
-            self.view_mode = ViewMode::Details;
-            self.details_scroll = 0;
-            self.details_scroll_x = 0;
+        let Some(idx) = self.list_state.selected() else {
+            return;
+        };
+        let Some(commit) = self.commits.get(idx) else {
+            return;
+        };
+        let RepoState::Loaded(repo, _) = &self.repo_state else {
+            self.status = Some("No repository loaded".to_string());
+            return;
+        };
+        match repo.commit_details(&commit.oid) {
+            Ok(details) => {
+                self.commit_details = Some(details);
+                self.view_mode = ViewMode::Details;
+                self.details_scroll = 0;
+                self.details_scroll_x = 0;
+                self.status = None;
+            }
+            Err(e) => self.status = Some(format!("Failed to load commit details: {e}")),
         }
     }
 
     pub fn close_details(&mut self) {
         self.view_mode = ViewMode::Graph;
+        self.status = None;
     }
 
     /// Content dimensions of the details pane for the current view mode, as
-    /// `(number_of_lines, widest_line_width)`.
+    /// `(number_of_lines, widest_line_display_width)`. Widths are measured in
+    /// display columns (`unicode-width`), not bytes, so non-ASCII summaries,
+    /// authors, and paths scroll to the correct offset instead of overshooting.
     //  Used by both vertical and horizontal detail scrolling
     /// so the two view-mode match arms are not duplicated.
     fn content_dimensions(&self) -> (u16, u16) {
         match self.view_mode {
             ViewMode::Details => {
                 if let Some(details) = &self.commit_details {
-                    let lines = 30u16;
-                    let mut max_len = 0usize;
-                    max_len = max_len.max(details.summary.len());
-                    max_len = max_len.max(details.author.len());
-                    max_len = max_len.max(details.oid.len() + 2);
+                    // Same formatter `ui::render` uses to build the Details
+                    // paragraph, so the line count can't drift from what's
+                    // actually on screen.
+                    let text = crate::app::details_text::format(details);
+                    let lines = text.lines().count() as u16;
+                    let max_len = text.lines().map(|l| l.width()).max().unwrap_or(0);
                     (lines, max_len as u16)
                 } else {
                     (0, 0)
@@ -257,13 +267,13 @@ impl AppState {
                 self.changed_files.len() as u16,
                 self.changed_files
                     .iter()
-                    .map(|s| s.len())
+                    .map(|s| s.width())
                     .max()
                     .unwrap_or(0) as u16,
             ),
             ViewMode::Diff => (
                 self.diff_lines.len() as u16,
-                self.diff_lines.iter().map(|s| s.len()).max().unwrap_or(0) as u16,
+                self.diff_lines.iter().map(|s| s.width()).max().unwrap_or(0) as u16,
             ),
             ViewMode::Graph | ViewMode::Refs => (0, 0),
         }
@@ -271,8 +281,9 @@ impl AppState {
 
     pub fn scroll_details_down(&mut self) {
         let (max_content_lines, _) = self.content_dimensions();
-        let term_height = crossterm::terminal::size().map(|s| s.1).unwrap_or(24);
-        let visible_height = term_height.saturating_sub(8);
+        // Inner height of the last-rendered details pane; the border already
+        // accounts for itself since `details_pane` is the block's inner area.
+        let visible_height = self.details_pane.height;
         let max_scroll = max_content_lines.saturating_sub(visible_height);
 
         self.details_scroll = self.details_scroll.saturating_add(1).min(max_scroll);
@@ -285,8 +296,7 @@ impl AppState {
     pub fn scroll_details_right(&mut self) {
         let (_, max_line_len) = self.content_dimensions();
 
-        let term_width = crossterm::terminal::size().map(|s| s.0).unwrap_or(80);
-        let visible_width = (term_width * 30 / 100).saturating_sub(2);
+        let visible_width = self.details_pane.width;
         let max_scroll_x = max_line_len.saturating_sub(visible_width);
 
         self.details_scroll_x = self.details_scroll_x.saturating_add(1).min(max_scroll_x);
@@ -297,28 +307,48 @@ impl AppState {
     }
 
     pub fn load_files(&mut self) {
-        if let Some(idx) = self.list_state.selected()
-            && let Some(commit) = self.commits.get(idx)
-            && let RepoState::Loaded(repo, _) = &self.repo_state
-            && let Ok(files) = repo.changed_files(&commit.oid)
-        {
-            self.changed_files = files;
-            self.view_mode = ViewMode::Files;
-            self.details_scroll = 0;
-            self.details_scroll_x = 0;
+        let Some(idx) = self.list_state.selected() else {
+            return;
+        };
+        let Some(commit) = self.commits.get(idx) else {
+            return;
+        };
+        let RepoState::Loaded(repo, _) = &self.repo_state else {
+            self.status = Some("No repository loaded".to_string());
+            return;
+        };
+        match repo.changed_files(&commit.oid) {
+            Ok(files) => {
+                self.changed_files = files;
+                self.view_mode = ViewMode::Files;
+                self.details_scroll = 0;
+                self.details_scroll_x = 0;
+                self.status = None;
+            }
+            Err(e) => self.status = Some(format!("Failed to load changed files: {e}")),
         }
     }
 
     pub fn load_diff(&mut self) {
-        if let Some(idx) = self.list_state.selected()
-            && let Some(commit) = self.commits.get(idx)
-            && let RepoState::Loaded(repo, _) = &self.repo_state
-            && let Ok(lines) = repo.commit_diff(&commit.oid)
-        {
-            self.diff_lines = lines;
-            self.view_mode = ViewMode::Diff;
-            self.details_scroll = 0;
-            self.details_scroll_x = 0;
+        let Some(idx) = self.list_state.selected() else {
+            return;
+        };
+        let Some(commit) = self.commits.get(idx) else {
+            return;
+        };
+        let RepoState::Loaded(repo, _) = &self.repo_state else {
+            self.status = Some("No repository loaded".to_string());
+            return;
+        };
+        match repo.commit_diff(&commit.oid) {
+            Ok(lines) => {
+                self.diff_lines = lines;
+                self.view_mode = ViewMode::Diff;
+                self.details_scroll = 0;
+                self.details_scroll_x = 0;
+                self.status = None;
+            }
+            Err(e) => self.status = Some(format!("Failed to load diff: {e}")),
         }
     }
 
@@ -334,55 +364,35 @@ impl AppState {
     }
 
     pub fn load_refs(&mut self) {
-        if let RepoState::Loaded(repo, _) = &self.repo_state
-            && let Ok(refs) = repo.refs()
-        {
-            self.refs = Some(refs);
-            self.view_mode = ViewMode::Refs;
-            self.refs_list_state.select(Some(0));
+        let RepoState::Loaded(repo, _) = &self.repo_state else {
+            self.status = Some("No repository loaded".to_string());
+            return;
+        };
+        match repo.refs() {
+            Ok(refs) => {
+                self.refs_rows = refs.rows();
+                self.refs = Some(refs);
+                self.view_mode = ViewMode::Refs;
+                // Land on the first selectable entry, not the "Local
+                // Branches" header, if there is one.
+                let first_entry = self.refs_rows.iter().position(|r| !r.is_header());
+                self.refs_list_state.select(first_entry.or(Some(0)));
+                self.status = None;
+            }
+            Err(e) => self.status = Some(format!("Failed to load branches & tags: {e}")),
         }
     }
 
     pub fn scroll_refs_down(&mut self) {
-        if let Some(refs) = &self.refs {
-            let total =
-                refs.local_branches.len() + refs.remote_branches.len() + refs.tags.len() + 3;
-            if total == 0 {
-                return;
-            }
-            let i = match self.refs_list_state.selected() {
-                Some(i) => {
-                    if i >= total - 1 {
-                        total - 1
-                    } else {
-                        i + 1
-                    }
-                }
-                None => 0,
-            };
-            self.refs_list_state.select(Some(i));
-        }
+        step_selection_skipping(&mut self.refs_list_state, &self.refs_rows, 1, |r| {
+            r.is_header()
+        });
     }
 
     pub fn scroll_refs_up(&mut self) {
-        if let Some(refs) = &self.refs {
-            let total =
-                refs.local_branches.len() + refs.remote_branches.len() + refs.tags.len() + 3;
-            if total == 0 {
-                return;
-            }
-            let i = match self.refs_list_state.selected() {
-                Some(i) => {
-                    if i == 0 {
-                        0
-                    } else {
-                        i - 1
-                    }
-                }
-                None => 0,
-            };
-            self.refs_list_state.select(Some(i));
-        }
+        step_selection_skipping(&mut self.refs_list_state, &self.refs_rows, -1, |r| {
+            r.is_header()
+        });
     }
 
     pub fn start_search(&mut self) {
@@ -437,6 +447,67 @@ impl AppState {
             self.list_state.select(Some(idx));
             self.refresh_view();
         }
+    }
+}
+
+fn step_selection(state: &mut ListState, len: usize, step: i32) {
+    if len == 0 {
+        return;
+    }
+    let last = len - 1;
+    let i = match state.selected() {
+        Some(i) => {
+            if step > 0 {
+                if i >= last { last } else { i + 1 }
+            } else if i == 0 {
+                0
+            } else {
+                i - 1
+            }
+        }
+        None => 0,
+    };
+    state.select(Some(i));
+}
+
+/// Same as `step_selection`, but skips over rows for which `is_unselectable`
+/// returns true (the refs pane's section headers) instead of landing on them.
+/// Falls back to the current index if every row in the stepped direction is
+/// unselectable, so the selection never disappears.
+fn step_selection_skipping<T>(
+    state: &mut ListState,
+    rows: &[T],
+    step: i32,
+    is_unselectable: impl Fn(&T) -> bool,
+) {
+    if rows.is_empty() {
+        return;
+    }
+    let last = rows.len() - 1;
+    let start = state.selected().unwrap_or(0).min(last);
+    let mut i = start;
+    loop {
+        let next = if step > 0 {
+            if i >= last {
+                break;
+            }
+            i + 1
+        } else {
+            if i == 0 {
+                break;
+            }
+            i - 1
+        };
+        i = next;
+        if !is_unselectable(&rows[i]) {
+            state.select(Some(i));
+            return;
+        }
+    }
+    // Hit the end without finding a selectable row; keep the original
+    // selection instead of landing on a header.
+    if !is_unselectable(&rows[start]) {
+        state.select(Some(start));
     }
 }
 

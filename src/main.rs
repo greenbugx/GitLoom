@@ -3,7 +3,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use gitloom::app::AppState;
+use gitloom::app::{AppState, ViewMode};
 use gitloom::ui;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
@@ -104,53 +104,36 @@ fn handle_key(app_state: &mut AppState, key: KeyEvent) {
         return;
     }
 
-    if app_state.view_mode != gitloom::app::ViewMode::Graph {
-        match code {
-            KeyCode::Esc | KeyCode::Char('q') => app_state.close_details(),
-            KeyCode::Char('j') | KeyCode::Down => {
-                if app_state.view_mode == gitloom::app::ViewMode::Refs {
-                    app_state.scroll_refs_down();
-                } else {
-                    app_state.scroll_details_down();
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if app_state.view_mode == gitloom::app::ViewMode::Refs {
-                    app_state.scroll_refs_up();
-                } else {
-                    app_state.scroll_details_up();
-                }
-            }
-            KeyCode::Right | KeyCode::Char('l') => app_state.scroll_details_right(),
-            KeyCode::Left | KeyCode::Char('h') => app_state.scroll_details_left(),
-            KeyCode::Enter => {
-                if app_state.view_mode == gitloom::app::ViewMode::Refs {
-                    app_state.close_details();
-                } else {
-                    app_state.load_details();
-                }
-            }
-            KeyCode::Char('f') => app_state.load_files(),
-            KeyCode::Char('d') => app_state.load_diff(),
-            KeyCode::Char('b') => app_state.load_refs(),
-            KeyCode::Char('/') => app_state.start_search(),
-            KeyCode::Char('n') => app_state.next_search_result(),
-            KeyCode::Char('N') => app_state.previous_search_result(),
-            _ => {}
-        }
-    } else {
-        match code {
-            KeyCode::Char('q') => app_state.quit = true,
-            KeyCode::Char('j') | KeyCode::Down => app_state.next_commit(),
-            KeyCode::Char('k') | KeyCode::Up => app_state.previous_commit(),
-            KeyCode::Enter => app_state.load_details(),
-            KeyCode::Char('f') => app_state.load_files(),
-            KeyCode::Char('d') => app_state.load_diff(),
-            KeyCode::Char('b') => app_state.load_refs(),
-            KeyCode::Char('/') => app_state.start_search(),
-            KeyCode::Char('n') => app_state.next_search_result(),
-            KeyCode::Char('N') => app_state.previous_search_result(),
-            _ => {}
-        }
+    // A single table of (view_mode, key) instead of two match arms that each
+    // hand-list f/d/b/n/N/etc. and then re-test the view mode inside
+    // themselves. Every binding lives in exactly one place now, so the Graph
+    // and detail-pane arms can't quietly drift apart from each other.
+    // `view_mode` is copied out first (it's a plain enum, no data) so the
+    // match arms are free to take `&mut app_state`.
+    let view_mode = app_state.view_mode;
+    match (view_mode, code) {
+        (ViewMode::Graph, KeyCode::Char('q')) => app_state.quit = true,
+        (_, KeyCode::Esc | KeyCode::Char('q')) => app_state.close_details(),
+
+        (ViewMode::Graph, KeyCode::Char('j') | KeyCode::Down) => app_state.next_commit(),
+        (ViewMode::Graph, KeyCode::Char('k') | KeyCode::Up) => app_state.previous_commit(),
+        (ViewMode::Refs, KeyCode::Char('j') | KeyCode::Down) => app_state.scroll_refs_down(),
+        (ViewMode::Refs, KeyCode::Char('k') | KeyCode::Up) => app_state.scroll_refs_up(),
+        (_, KeyCode::Char('j') | KeyCode::Down) => app_state.scroll_details_down(),
+        (_, KeyCode::Char('k') | KeyCode::Up) => app_state.scroll_details_up(),
+
+        (_, KeyCode::Right | KeyCode::Char('l')) => app_state.scroll_details_right(),
+        (_, KeyCode::Left | KeyCode::Char('h')) => app_state.scroll_details_left(),
+
+        (ViewMode::Refs, KeyCode::Enter) => app_state.close_details(),
+        (_, KeyCode::Enter) => app_state.load_details(),
+
+        (_, KeyCode::Char('f')) => app_state.load_files(),
+        (_, KeyCode::Char('d')) => app_state.load_diff(),
+        (_, KeyCode::Char('b')) => app_state.load_refs(),
+        (_, KeyCode::Char('/')) => app_state.start_search(),
+        (_, KeyCode::Char('n')) => app_state.next_search_result(),
+        (_, KeyCode::Char('N')) => app_state.previous_search_result(),
+        _ => {}
     }
 }
