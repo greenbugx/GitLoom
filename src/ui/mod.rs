@@ -1,7 +1,8 @@
+mod help;
 mod loading;
 
 use crate::app::details_text;
-use crate::app::{AppState, RefPaneRow, RepoState};
+use crate::app::{AppState, HistoryScope, RefPaneRow, RepoState};
 use crate::git::repository::{Branch, Ref};
 use crate::graph::layout::lane_color;
 use ratatui::{
@@ -32,7 +33,19 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     let horizontal = Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)]);
     let main_chunks = horizontal.split(chunks[1]);
 
-    let graph_block = Block::bordered().title("GRAPH AREA");
+    // The graph pane's title doubles as the scope indicator: without it, a
+    // filtered history looks like a repository that has lost most of its
+    // commits. Built as an owned string so the block borrows nothing from
+    // `state`, leaving it free to be mutated just below.
+    let graph_title = match &state.history {
+        HistoryScope::All => "GRAPH AREA".to_string(),
+        HistoryScope::File(path) => format!("HISTORY OF {path}"),
+    };
+    let graph_block = Block::bordered().title(graph_title);
+
+    // Recorded for the same reason as `details_pane` below: page keys move by
+    // the number of rows actually on screen rather than a guess.
+    state.graph_pane = graph_block.inner(main_chunks[0]);
 
     if state.commits.is_empty() {
         if let Some(load) = &state.loading {
@@ -155,6 +168,11 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     // terminal size and the layout percentages above.
     state.details_pane = details_block.inner(main_chunks[1]);
 
+    // Fetches now run off the UI thread, so a pane can legitimately be empty
+    // for a frame or two. Saying so beats an empty box that looks like a
+    // commit with no diff. `&'static str`, so this holds no borrow of `state`.
+    let pending = state.pending_label();
+
     match state.view_mode {
         crate::app::ViewMode::Details => {
             if let Some(details) = &state.commit_details {
@@ -164,50 +182,64 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
                     .scroll((state.details_scroll, state.details_scroll_x));
                 f.render_widget(details_para, main_chunks[1]);
             } else {
-                f.render_widget(details_block, main_chunks[1]);
+                f.render_widget(placeholder(details_block, pending), main_chunks[1]);
             }
         }
         crate::app::ViewMode::Files => {
-            let content = state.changed_files.join("\n");
-            let details_text = Paragraph::new(content)
-                .block(details_block)
-                .scroll((state.details_scroll, state.details_scroll_x));
-            f.render_widget(details_text, main_chunks[1]);
+            if state.changed_files.is_empty() {
+                f.render_widget(placeholder(details_block, pending), main_chunks[1]);
+            } else {
+                // A list rather than a paragraph so a path can be selected and
+                // its history opened with `l`. That costs the horizontal
+                // scrolling a paragraph had; long paths are rare next to the
+                // diff pane, and the graph pane is the wide one. :)
+                let items: Vec<ListItem> = state
+                    .changed_files
+                    .iter()
+                    .map(|path| ListItem::new(format!(" {}", path)))
+                    .collect();
+                let list = List::new(items)
+                    .block(details_block)
+                    .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                f.render_stateful_widget(list, main_chunks[1], &mut state.files_list_state);
+            }
         }
         crate::app::ViewMode::Diff => {
-            use ratatui::style::{Color, Style};
-            let mut lines = Vec::new();
-            for line in &state.diff_lines {
-                if line.starts_with('+') {
-                    lines.push(Line::from(Span::styled(
-                        line.clone(),
-                        Style::default().fg(Color::Green),
-                    )));
-                } else if line.starts_with('-') {
-                    lines.push(Line::from(Span::styled(
-                        line.clone(),
-                        Style::default().fg(Color::Red),
-                    )));
-                } else if line.starts_with("@@") {
-                    lines.push(Line::from(Span::styled(
-                        line.clone(),
-                        Style::default().fg(Color::Cyan),
-                    )));
-                } else {
-                    lines.push(Line::from(line.clone()));
+            if state.diff_lines.is_empty() {
+                f.render_widget(placeholder(details_block, pending), main_chunks[1]);
+            } else {
+                let mut lines = Vec::new();
+                for line in &state.diff_lines {
+                    if line.starts_with('+') {
+                        lines.push(Line::from(Span::styled(
+                            line.clone(),
+                            Style::default().fg(Color::Green),
+                        )));
+                    } else if line.starts_with('-') {
+                        lines.push(Line::from(Span::styled(
+                            line.clone(),
+                            Style::default().fg(Color::Red),
+                        )));
+                    } else if line.starts_with("@@") {
+                        lines.push(Line::from(Span::styled(
+                            line.clone(),
+                            Style::default().fg(Color::Cyan),
+                        )));
+                    } else {
+                        lines.push(Line::from(line.clone()));
+                    }
                 }
+                let details_text = Paragraph::new(lines)
+                    .block(details_block)
+                    .scroll((state.details_scroll, state.details_scroll_x));
+                f.render_widget(details_text, main_chunks[1]);
             }
-            let details_text = Paragraph::new(lines)
-                .block(details_block)
-                .scroll((state.details_scroll, state.details_scroll_x));
-            f.render_widget(details_text, main_chunks[1]);
         }
         crate::app::ViewMode::Graph => {
             f.render_widget(details_block, main_chunks[1]);
         }
         crate::app::ViewMode::Refs => {
             if state.refs.is_some() {
-                use ratatui::style::{Color, Modifier, Style};
                 let header_style = Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD);
@@ -232,9 +264,12 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
                     .block(details_block)
                     .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White));
 
-                // clone state.refs_list_state since render_stateful_widget takes a mut ref
-                let mut list_state = state.refs_list_state;
-                f.render_stateful_widget(list, main_chunks[1], &mut list_state);
+                // The real state, not a copy: `List` writes its scroll offset
+                // back through this handle, and a copy discarded it, which
+                // pinned the pane to the first screenful. `refs_rows` and
+                // `refs_list_state` are separate fields, so borrowing one
+                // immutably and the other mutably is fine.
+                f.render_stateful_widget(list, main_chunks[1], &mut state.refs_list_state);
             } else {
                 f.render_widget(details_block, main_chunks[1]);
             }
@@ -248,23 +283,46 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     } else if let Some(load) = &state.loading {
         Paragraph::new(loading::status_line(load)).block(bottom_block)
     } else if let Some(status) = &state.status {
-        // Surfaces the failure a load_* call swallowed instead of leaving the
-        // key press looking like a no-op.
-        Paragraph::new(format!(" {}", status))
-            .style(Style::default().fg(Color::Red))
+        // Surfaces what a key press would otherwise have swallowed: a failed
+        // load, or a confirmation like a yanked hash.
+        let color = if status.is_error() {
+            Color::Red
+        } else {
+            Color::Green
+        };
+        Paragraph::new(format!(" {}", status.text()))
+            .style(Style::default().fg(color))
             .block(bottom_block)
     } else if !state.search_results.is_empty() {
         let text = format!(
-            " ↑/↓ j/k Nav   Enter Details   f Files   d Diff   b Branches   / Search   n/N Match {}/{}   Esc Close   q Quit",
+            " ↑/↓ j/k Nav   Enter Details   f Files   d Diff   b Branches   / Search   n/N Match {}/{}   Esc Close   ? Help   q Quit",
             state.search_index + 1,
             state.search_results.len()
         );
         Paragraph::new(text).block(bottom_block)
     } else {
-        Paragraph::new(" ↑/↓ j/k Navigate/Scroll   Enter Details   f Files   d Diff   b Branches   / Search   Esc Close   q Quit").block(bottom_block)
+        Paragraph::new(" ↑/↓ j/k Navigate/Scroll   Enter Details   f Files   d Diff   b Branches   / Search   y Yank   Esc Close   ? Help   q Quit").block(bottom_block)
     };
 
     f.render_widget(bottom_text, chunks[2]);
+
+    // Last, and over the whole frame: the overlay floats above every pane
+    // rather than being a view mode of its own.
+    if state.show_help {
+        help::render(f, f.area());
+    }
+}
+
+/// A pane with nothing in it yet: the fetch's label while one is in flight,
+/// otherwise just the empty bordered box.
+fn placeholder<'a>(block: Block<'a>, pending: Option<&'static str>) -> Paragraph<'a> {
+    let content = match pending {
+        Some(label) => format!("\n  {}...", label),
+        None => String::new(),
+    };
+    Paragraph::new(content)
+        .style(Style::default().fg(Color::DarkGray))
+        .block(block)
 }
 
 /// Color the conventional-commit prefix of a summary, leaving the rest plain:
