@@ -1,5 +1,7 @@
 # GitLoom
 
+<img width="130" height="105" alt="Screenshot 2026-08-24 005923" src="https://github.com/user-attachments/assets/457395cf-aa37-4b6f-8245-466b6b210d7f" />
+
 A fast, lightweight, keyboard-first terminal-based Git history explorer designed to make complex Git repositories easy to understand.
 
 ## Features
@@ -20,11 +22,13 @@ A fast, lightweight, keyboard-first terminal-based Git history explorer designed
 
 <img src="https://github.com/user-attachments/assets/5a46bc1f-7f00-49fc-ba6c-359f7179fa66" width="100%">
 
-<img src="https://github.com/user-attachments/assets/86e6d15e-e83a-4e32-be6a-c6b8fd68da17" width="100%">
+<img width="1899" height="963" alt="image" src="https://github.com/user-attachments/assets/2ea2257b-c419-471d-ade4-a2d7ee4adf37" />
 
-<img src="https://github.com/user-attachments/assets/d56a3d47-d848-4cd8-8802-caed6b1e3436" width="100%">
+<img width="1899" height="965" alt="image" src="https://github.com/user-attachments/assets/884bf2f6-f6c1-415b-bb65-b9b1e424f211" />
 
-<img src="https://github.com/user-attachments/assets/2fa94c69-d156-4264-9183-8c33af93a272" width="100%">
+<img width="1900" height="968" alt="image" src="https://github.com/user-attachments/assets/90196e00-2643-4db8-8b43-161e74b5e044" />
+
+<img width="1898" height="973" alt="image" src="https://github.com/user-attachments/assets/bf9d9211-55e0-4728-a081-a6e6ae8ca9a2" />
 
 ## Usage
 
