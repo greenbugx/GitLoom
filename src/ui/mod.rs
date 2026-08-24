@@ -1,8 +1,8 @@
 mod loading;
 
 use crate::app::details_text;
-use crate::app::{AppState, RepoState};
-use crate::git::repository::{RefKind, RefRow};
+use crate::app::{AppState, RefPaneRow, RepoState};
+use crate::git::repository::{Branch, Ref};
 use crate::graph::layout::lane_color;
 use ratatui::{
     Frame,
@@ -95,14 +95,14 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
                 // remote branches red, tags yellow.
                 if let Some(badges) = state.ref_map.get(&c.oid) {
                     for badge in badges {
-                        let color = match badge.kind {
-                            RefKind::Local => Color::Green,
-                            RefKind::Remote => Color::Red,
-                            RefKind::Tag => Color::Yellow,
+                        let color = match badge {
+                            Ref::Branch(Branch::Local(_)) => Color::Green,
+                            Ref::Branch(Branch::Remote(_)) => Color::Red,
+                            Ref::Tag(_) => Color::Yellow,
                         };
                         spans.push(Span::raw(" "));
                         spans.push(Span::styled(
-                            badge.name.clone(),
+                            badge.name().to_string(),
                             Style::default().fg(color).add_modifier(Modifier::BOLD),
                         ));
                     }
@@ -217,10 +217,13 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
                     .refs_rows
                     .iter()
                     .map(|row| match row {
-                        RefRow::Header(title) => {
+                        RefPaneRow::Header(title) => {
                             ListItem::new(title.to_string()).style(header_style)
                         }
-                        RefRow::Entry(name) => {
+                        RefPaneRow::Branch(branch) => {
+                            ListItem::new(format!("  {}", branch.name())).style(item_style)
+                        }
+                        RefPaneRow::Tag(name) => {
                             ListItem::new(format!("  {}", name)).style(item_style)
                         }
                     })

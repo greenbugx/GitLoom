@@ -4,4 +4,4 @@ pub mod state;
 
 pub use loading::{LoadStage, LoadingState};
 pub use state::ViewMode;
-pub use state::{AppState, RepoState};
+pub use state::{AppState, RefPaneRow, RepoState, ref_pane_rows};

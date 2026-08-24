@@ -1,6 +1,6 @@
 use crate::app::loading::{self, LoadMessage, LoadingState};
 use crate::git::commit::CommitInfo;
-use crate::git::repository::{GitRepository, RefBadge, RefRow, RepoInfo};
+use crate::git::repository::{Branch, GitRepository, Ref, RefName, RepoInfo, RepoRefs};
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use std::collections::HashMap;
@@ -10,6 +10,58 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::git::commit::CommitDetails;
 use crate::graph::layout::GraphRow;
+
+/// One row of the refs pane: a non-selectable section header, a branch entry or
+/// a tag entry.
+///
+/// This is a presentation type, which is why it lives here and not in
+/// `git::repository`: the Git layer models refs, and the application layer
+/// decides that they are shown as three labelled sections. Rows own their
+/// values rather than borrowing from a [`RepoRefs`] so `AppState` can hold the
+/// flattened rows next to the refs they came from without a self-referential
+/// borrow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefPaneRow {
+    Header(&'static str),
+    Branch(Branch),
+    Tag(RefName),
+}
+
+impl RefPaneRow {
+    pub fn is_header(&self) -> bool {
+        matches!(self, RefPaneRow::Header(_))
+    }
+}
+
+/// Flatten discovered refs into pane rows: each section header followed by its
+/// entries, in `Local Branches / Remote Branches / Tags` order. Empty sections
+/// still get a header row so the pane layout stays stable.
+///
+/// Flattening once, at load time, keeps the selectable-row count in one place
+/// instead of recomputing `local + remote + tags + 3` everywhere the pane is
+/// scrolled or rendered.
+pub fn ref_pane_rows(refs: &RepoRefs) -> Vec<RefPaneRow> {
+    let mut rows = Vec::with_capacity(refs.branches.len() + refs.tags.len() + 3);
+    rows.push(RefPaneRow::Header("Local Branches"));
+    rows.extend(
+        refs.branches
+            .iter()
+            .filter(|b| matches!(b, Branch::Local(_)))
+            .cloned()
+            .map(RefPaneRow::Branch),
+    );
+    rows.push(RefPaneRow::Header("Remote Branches"));
+    rows.extend(
+        refs.branches
+            .iter()
+            .filter(|b| matches!(b, Branch::Remote(_)))
+            .cloned()
+            .map(RefPaneRow::Branch),
+    );
+    rows.push(RefPaneRow::Header("Tags"));
+    rows.extend(refs.tags.iter().cloned().map(RefPaneRow::Tag));
+    rows
+}
 
 pub enum RepoState {
     None,
@@ -39,11 +91,11 @@ pub struct AppState {
     pub view_mode: ViewMode,
     pub changed_files: Vec<String>,
     pub diff_lines: Vec<String>,
-    pub refs: Option<crate::git::repository::RepoRefs>,
+    pub refs: Option<RepoRefs>,
     /// `refs` flattened into header/entry rows, rebuilt whenever `refs` is.
     /// Scrolling and rendering both walk this instead of recomputing
     /// `local + remote + tags + 3` and re-deriving header positions.
-    pub refs_rows: Vec<RefRow>,
+    pub refs_rows: Vec<RefPaneRow>,
     pub refs_list_state: ListState,
     pub search_query: String,
     pub is_searching: bool,
@@ -52,7 +104,7 @@ pub struct AppState {
     /// Point-in-time OID -> ref badges snapshot, loaded once at init.
     /// `GitRepository::ref_map` is NOT live and must be rebuilt if a
     /// future refresh/reload command is added.
-    pub ref_map: HashMap<String, Vec<RefBadge>>,
+    pub ref_map: HashMap<String, Vec<Ref>>,
     /// Precomputed minimap sparkline char per commit (indexed by commit order).
     /// Arrives together with the commits, so it is only empty without history.
     pub minimap: Vec<char>,
@@ -370,7 +422,7 @@ impl AppState {
         };
         match repo.refs() {
             Ok(refs) => {
-                self.refs_rows = refs.rows();
+                self.refs_rows = ref_pane_rows(&refs);
                 self.refs = Some(refs);
                 self.view_mode = ViewMode::Refs;
                 // Land on the first selectable entry, not the "Local
