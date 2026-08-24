@@ -9,3 +9,6 @@ crossterm = "0.29.0"
 git2 = "0.21.0"
 ratatui = "0.30.2"
 unicode-width = "0.2.0"
+
+[dev-dependencies]
+tempfile = "3.15"
