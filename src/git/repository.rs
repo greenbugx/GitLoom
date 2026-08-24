@@ -214,70 +214,81 @@ impl GitRepository {
     }
 }
 
+/// Note this is deliberately *not* called `Tag`: a tag is one kind of ref, but
+/// a ref name is the name of any of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefName(String);
+
+impl RefName {
+    pub fn new(name: impl Into<String>) -> Self {
+        RefName(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RefName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A branch, with its locality carried by the enum tag itself. Consumers learn
+/// whether a branch is local or remote by matching the variant; there is
+/// deliberately no separate `kind` field duplicating that information.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Branch {
+    Local(RefName),
+    Remote(RefName),
+}
+
+impl Branch {
+    /// The branch's name, whichever locality it has. Lets display code that
+    /// doesn't care about local-vs-remote avoid matching just to read the name.
+    pub fn name(&self) -> &RefName {
+        match self {
+            Branch::Local(name) | Branch::Remote(name) => name,
+        }
+    }
+}
+
+/// Every ref discovered in a repository. This is the Git domain model only:
+/// flattening it into section headers and selectable rows is the UI's job, so
+/// nothing here knows about panes, headers or selection indices.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoRefs {
-    pub local_branches: Vec<String>,
-    pub remote_branches: Vec<String>,
-    pub tags: Vec<String>,
+    pub branches: Vec<Branch>,
+    pub tags: Vec<RefName>,
 }
 
-/// A single row of the flattened refs pane: either a section header or a
-/// selectable branch/tag entry. Flattening once at load time means the
-/// selectable-row count lives in one place instead of being
-/// recomputed as `local + remote + tags + 3` wherever the
-/// refs pane is scrolled or rendered.
+/// A single ref pointing at a commit, rendered as an inline badge beside that
+/// commit's summary. Branch locality already lives in [`Branch`], so this
+/// composes `Branch` rather than repeating a local/remote/tag discriminant.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RefRow {
-    Header(&'static str),
-    Entry(String),
+pub enum Ref {
+    Branch(Branch),
+    Tag(RefName),
 }
 
-impl RefRow {
-    pub fn is_header(&self) -> bool {
-        matches!(self, RefRow::Header(_))
+impl Ref {
+    /// The ref's name, whichever kind of ref it is.
+    pub fn name(&self) -> &RefName {
+        match self {
+            Ref::Branch(branch) => branch.name(),
+            Ref::Tag(name) => name,
+        }
     }
-}
-
-impl RepoRefs {
-    /// Flatten into display rows: a header followed by its entries, per
-    /// section, in `Local Branches / Remote Branches / Tags` order. Empty
-    /// sections still get a header row so the pane layout is stable.
-    pub fn rows(&self) -> Vec<RefRow> {
-        let mut rows = Vec::with_capacity(
-            self.local_branches.len() + self.remote_branches.len() + self.tags.len() + 3,
-        );
-        rows.push(RefRow::Header("Local Branches"));
-        rows.extend(self.local_branches.iter().cloned().map(RefRow::Entry));
-        rows.push(RefRow::Header("Remote Branches"));
-        rows.extend(self.remote_branches.iter().cloned().map(RefRow::Entry));
-        rows.push(RefRow::Header("Tags"));
-        rows.extend(self.tags.iter().cloned().map(RefRow::Entry));
-        rows
-    }
-}
-
-/// The kind of a ref badge shown inline next to a commit summary
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefKind {
-    Local,
-    Remote,
-    Tag,
-}
-
-/// A single ref badge displayed next to a commit (branch name, remote branch or tag)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RefBadge {
-    pub kind: RefKind,
-    pub name: String,
 }
 
 impl GitRepository {
     pub fn refs(&self) -> Result<RepoRefs, git2::Error> {
-        let mut local_branches = Vec::new();
-        let mut remote_branches = Vec::new();
+        let mut branches = Vec::new();
 
         for (b, _) in self.repo.branches(Some(git2::BranchType::Local))?.flatten() {
             if let Ok(Some(name)) = b.name() {
-                local_branches.push(name.to_string());
+                branches.push(Branch::Local(RefName::new(name)));
             }
         }
 
@@ -287,7 +298,7 @@ impl GitRepository {
             .flatten()
         {
             if let Ok(Some(name)) = b.name() {
-                remote_branches.push(name.to_string());
+                branches.push(Branch::Remote(RefName::new(name)));
             }
         }
 
@@ -295,15 +306,11 @@ impl GitRepository {
         let tag_names = self.repo.tag_names(None)?;
         for i in 0..tag_names.len() {
             if let Ok(Some(name)) = tag_names.get(i) {
-                tags.push(name.to_string());
+                tags.push(RefName::new(name));
             }
         }
 
-        Ok(RepoRefs {
-            local_branches,
-            remote_branches,
-            tags,
-        })
+        Ok(RepoRefs { branches, tags })
     }
 
     /// Build a point-in-time map from commit OID to the refs pointing at it
@@ -312,8 +319,8 @@ impl GitRepository {
     /// NOTE: This is a SNAPSHOT built once from `repo.refs()` at load time.
     ///  It is NOT live, if a future refresh/reload command is added, this map must be rebuilt.
     /// :(
-    pub fn ref_map(&self) -> Result<HashMap<String, Vec<RefBadge>>, git2::Error> {
-        let mut map: HashMap<String, Vec<RefBadge>> = HashMap::new();
+    pub fn ref_map(&self) -> Result<HashMap<String, Vec<Ref>>, git2::Error> {
+        let mut map: HashMap<String, Vec<Ref>> = HashMap::new();
 
         // HEAD: when it points at a branch, the branch itself is added below
         // via `references()`, so only emit a distinct badge when detached.
@@ -323,38 +330,29 @@ impl GitRepository {
         {
             map.entry(commit.id().to_string())
                 .or_default()
-                .push(RefBadge {
-                    kind: RefKind::Local,
-                    name: "HEAD".to_string(),
-                });
+                .push(Ref::Branch(Branch::Local(RefName::new("HEAD"))));
         }
 
         for reference in self.repo.references()? {
             let reference = reference?;
             let name = reference.name().unwrap_or("");
-            let kind = if name.starts_with("refs/heads/") {
-                Some(RefKind::Local)
-            } else if name.starts_with("refs/remotes/") {
-                Some(RefKind::Remote)
-            } else if name.starts_with("refs/tags/") {
-                Some(RefKind::Tag)
+            // Classify by prefix and strip it in one step: each arm both names
+            // the ref kind and yields the short display name, so the kind and
+            // the stripping can't fall out of sync.
+            let git_ref = if let Some(short) = name.strip_prefix("refs/heads/") {
+                Some(Ref::Branch(Branch::Local(RefName::new(short))))
+            } else if let Some(short) = name.strip_prefix("refs/remotes/") {
+                Some(Ref::Branch(Branch::Remote(RefName::new(short))))
             } else {
-                None
+                name.strip_prefix("refs/tags/")
+                    .map(|short| Ref::Tag(RefName::new(short)))
             };
-            if let Some(kind) = kind
+            if let Some(git_ref) = git_ref
                 && let Ok(commit) = reference.peel_to_commit()
             {
-                let short = name
-                    .strip_prefix("refs/heads/")
-                    .or_else(|| name.strip_prefix("refs/remotes/"))
-                    .or_else(|| name.strip_prefix("refs/tags/"))
-                    .unwrap_or(name);
                 map.entry(commit.id().to_string())
                     .or_default()
-                    .push(RefBadge {
-                        kind,
-                        name: short.to_string(),
-                    });
+                    .push(git_ref);
             }
         }
 

@@ -8,7 +8,8 @@ mod common;
 
 use common::TestRepo;
 use gitloom::app::AppState;
-use gitloom::git::repository::{GitRepository, RefKind};
+use gitloom::app::ref_pane_rows;
+use gitloom::git::repository::{Branch, GitRepository, Ref, RefName};
 use gitloom::graph::layout::GraphEngine;
 use std::collections::HashSet;
 
@@ -124,7 +125,7 @@ fn ref_map_attaches_badges_to_the_right_commits() {
     assert!(
         root_badges
             .iter()
-            .any(|b| b.kind == RefKind::Tag && b.name == "v0.1.0"),
+            .any(|b| matches!(b, Ref::Tag(name) if name.as_str() == "v0.1.0")),
         "root should carry the v0.1.0 tag badge"
     );
 
@@ -134,7 +135,7 @@ fn ref_map_attaches_badges_to_the_right_commits() {
     assert!(
         merge_badges
             .iter()
-            .any(|b| b.kind == RefKind::Local && b.name == "main"),
+            .any(|b| matches!(b, Ref::Branch(Branch::Local(name)) if name.as_str() == "main")),
         "merge should carry the local `main` branch badge"
     );
 
@@ -144,7 +145,7 @@ fn ref_map_attaches_badges_to_the_right_commits() {
     assert!(
         feature_badges
             .iter()
-            .any(|b| b.kind == RefKind::Local && b.name == "feature")
+            .any(|b| matches!(b, Ref::Branch(Branch::Local(name)) if name.as_str() == "feature"))
     );
 
     // base is an ancestor of both tips but isn't itself pointed at by any
@@ -155,26 +156,27 @@ fn ref_map_attaches_badges_to_the_right_commits() {
     );
 }
 
-/// `refs()` should list the branch and tag names created by the fixture,
-/// and `RepoRefs::rows()` should flatten them with a header per section.
 #[test]
 fn refs_lists_branches_and_tags_and_rows_flattens_them() {
     let (_repo_dir, fixture) = TestRepo::build_standard_fixture();
     let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
     let refs = repo.refs().expect("list refs");
 
-    assert!(refs.local_branches.contains(&"main".to_string()));
-    assert!(refs.local_branches.contains(&"feature".to_string()));
-    assert!(refs.tags.contains(&"v0.1.0".to_string()));
+    assert!(refs.branches.contains(&Branch::Local(RefName::new("main"))));
+    assert!(
+        refs.branches
+            .contains(&Branch::Local(RefName::new("feature")))
+    );
+    assert!(refs.tags.contains(&RefName::new("v0.1.0")));
 
-    let rows = refs.rows();
+    let rows = ref_pane_rows(&refs);
     let header_count = rows.iter().filter(|r| r.is_header()).count();
     assert_eq!(header_count, 3, "Local Branches / Remote Branches / Tags");
 
     let entry_count = rows.iter().filter(|r| !r.is_header()).count();
     assert_eq!(
         entry_count,
-        refs.local_branches.len() + refs.remote_branches.len() + refs.tags.len(),
+        refs.branches.len() + refs.tags.len(),
         "every branch and tag should appear as exactly one row"
     );
 }

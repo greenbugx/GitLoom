@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, SendError, Sender};
 use std::time::{Duration, Instant};
 
 use crate::git::commit::CommitInfo;
-use crate::git::repository::{self, GitRepository, RefBadge, RepoInfo};
+use crate::git::repository::{self, GitRepository, Ref, RepoInfo};
 use crate::graph::layout::{GraphEngine, GraphRow};
 
 pub const COMMIT_LIMIT: usize = 1000;
@@ -36,7 +36,7 @@ pub struct RepoData {
     pub info: RepoInfo,
     pub commits: Vec<CommitInfo>,
     pub graph_rows: Vec<GraphRow>,
-    pub ref_map: HashMap<String, Vec<RefBadge>>,
+    pub ref_map: HashMap<String, Vec<Ref>>,
     pub minimap: Vec<char>,
 }
 
