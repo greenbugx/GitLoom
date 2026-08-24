@@ -15,7 +15,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-test:
+  # Split across OSes because the event loop is platform-sensitive: Windows
+  # reports a key press AND a release per keystroke, and `main.rs` filters the
+  # release. Compiling and testing on both keeps that path from rotting.
+  test:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Report both results. A Windows-only failure is exactly the thing this
+      # matrix exists to surface, so it shouldn't cancel the Linux run.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Test
+        run: cargo test
+
+  # rustfmt and clippy are platform-independent, so running them once is enough
+  # and keeps the matrix from tripling the lint time.
+  lint:
+    name: Format and clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,14 +54,35 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        run: cargo build --all-targets
-
       - name: Format
         run: cargo fmt --check
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Test
-        run: cargo test
+  # Verifies the `rust-version` in Cargo.toml is actually the floor, instead of a
+  # number nobody has tested. Reads it from Cargo.toml so there is one source of
+  # truth: bump it there and this job follows.
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(grep '^rust-version' Cargo.toml | tr -d '"' | cut -d' ' -f3)
+          echo "Cargo.toml declares rust-version = $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `check`, not `build`: this job is about whether the code compiles on the
+      # declared floor, and a full build would double the matrix's cost again.
+      - name: Check
+        run: cargo check --all-targets

@@ -2,6 +2,10 @@
 name = "gitloom"
 version = "0.1.0"
 edition = "2024"
+# The event loop uses let-chains, which are stable only from 1.88 on edition 2024.
+# Enforced by the `msrv` job in .github/workflows/ci.yml, which reads this
+# value, so a wrong number here fails CI rather than misleading contributors.
+rust-version = "1.88"
 
 [dependencies]
 chrono = "0.4.45"
