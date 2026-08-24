@@ -7,30 +7,24 @@ A fast, lightweight, keyboard-first terminal-based Git history explorer designed
 - **Native terminal UI** built with `ratatui` and `crossterm`.
 - **Animated Loading Screen** inspired by Loom, featuring a smooth and minimal loading experience.
 - **Beautiful graph rendering** with per-lane colored glyphs, diagonal and corner connectors for branches and merges, all drawn in a strict 1-row-per-commit layout.
-- **Keyboard-driven navigation** across commits, views, and search results.
+- **Keyboard-driven navigation** across commits, views, and search results, with a `?` overlay that documents every binding.
 - **Inline ref badges** next to each commit summary — branches, remote branches, and tags color-coded at a glance.
 - **Conventional-commit prefix coloring** for `feat`, `fix`, `docs`, `chore`, `refactor`, and `test` commits.
 - **Commit activity minimap** — a per-row sparkline derived from each commit's insertions and deletions.
-- **Detailed views** for commit details, changed files, diffs, and branches & tags.
+- **Detailed views** for commit details, changed files, diffs, and branches & tags, fetched on a background thread so a large commit never stalls the UI.
+- **Single-path file history** — scope the graph to one file and walk only the commits that changed it.
 - **Incremental search** over commit summaries, authors, and OIDs.
+- **Copy a commit hash** with `y`, using OSC 52 so it works over SSH too.
 
 ## Screenshots
 
-<div align="center">
+<img src="https://github.com/user-attachments/assets/5a46bc1f-7f00-49fc-ba6c-359f7179fa66" width="100%">
 
-<table>
-<tr>
-<td><img src="https://github.com/user-attachments/assets/5a46bc1f-7f00-49fc-ba6c-359f7179fa66" width="100%"></td>
-<td><img src="https://github.com/user-attachments/assets/86e6d15e-e83a-4e32-be6a-c6b8fd68da17" width="100%"></td>
-</tr>
-<tr>
-<td><img src="https://github.com/user-attachments/assets/d56a3d47-d848-4cd8-8802-caed6b1e3436" width="100%"></td>
-<td><img src="https://github.com/user-attachments/assets/2fa94c69-d156-4264-9183-8c33af93a272" width="100%"></td>
-</tr>
-</table>
+<img src="https://github.com/user-attachments/assets/86e6d15e-e83a-4e32-be6a-c6b8fd68da17" width="100%">
 
-</div>
+<img src="https://github.com/user-attachments/assets/d56a3d47-d848-4cd8-8802-caed6b1e3436" width="100%">
 
+<img src="https://github.com/user-attachments/assets/2fa94c69-d156-4264-9183-8c33af93a272" width="100%">
 
 ## Usage
 
@@ -38,20 +32,32 @@ A fast, lightweight, keyboard-first terminal-based Git history explorer designed
 cargo run [path-to-repo]
 ```
 
-If no path is given, GitLoom opens the current directory.
+If no path is given, GitLoom opens the current directory; any directory inside a
+working tree will do. `--help` and `--version` print and exit without opening the
+TUI.
 
 ### Keybindings
 
+Press `?` inside GitLoom for this same table. `src/ui/help.rs` is the source of
+truth for both.
+
 | Key | Action |
 | --- | --- |
-| `↑`/`↓`, `j`/`k` | Navigate commits / scroll details |
+| `j`/`k`, `↓`/`↑` | Down / up — moves the selection, or scrolls a pane |
+| `J`/`K` | Next / previous commit, keeping the open pane in step |
+| `g`/`G`, `Home`/`End` | Top / bottom of the focused pane |
+| `PgUp`/`PgDn` | Move by a screenful |
+| `h`/`l`, `←`/`→` | Scroll a wide pane left / right |
 | `Enter` | Show commit details |
 | `f` | Show changed files |
 | `d` | Show diff |
 | `b` | Show branches & tags |
-| `/` | Search |
+| `l` in the files pane | History of the selected file |
+| `/` | Search summaries, authors, and OIDs |
 | `n`/`N` | Next / previous search match |
-| `Esc` | Close current view |
+| `y` | Copy the selected commit's full hash |
+| `?` | Toggle the keymap overlay |
+| `Esc` | Close the current view, or leave a file's history |
 | `q` | Quit |
 
 ## License
