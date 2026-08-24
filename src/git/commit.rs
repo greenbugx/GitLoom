@@ -1,3 +1,6 @@
+/// A commit, snapshotted into owned data so it can outlive the `git2::Commit`
+/// it was read from and cross a thread boundary (`git2` types are not `Send`).
+#[derive(Debug, Clone)]
 pub struct CommitInfo {
     pub oid: String,
     pub parents: Vec<String>,

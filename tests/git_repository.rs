@@ -432,3 +432,116 @@ fn fixture_produces_five_distinct_commits() {
         "the convenience list should match the named fields exactly"
     );
 }
+
+/// `README.md` is written once, by the root commit, and never again. Every
+/// later commit carries it forward unchanged, so a naive "the path exists in
+/// this tree" filter would return all five commits instead of one.
+#[test]
+fn file_history_returns_only_the_commits_that_changed_the_path() {
+    let (_repo_dir, fixture) = TestRepo::build_standard_fixture();
+    let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
+
+    let history = repo
+        .file_history("README.md", 100)
+        .expect("walk the history of README.md");
+
+    let oids: Vec<&str> = history.iter().map(|c| c.oid.as_str()).collect();
+    assert_eq!(oids, vec![fixture.root.as_str()]);
+    assert_eq!(history[0].summary, "chore: init repository");
+    assert_eq!(
+        history[0].parents.len(),
+        0,
+        "CommitInfo should carry real parents, not the filtered neighbours"
+    );
+}
+
+/// `src/lib.rs` is added by `base`, edited by `main_tip`, and reverted by the
+/// merge (which takes `feature`'s tree, where main's edit is absent). All
+/// three differ from their first parent at that path; `feature` and `root` do
+/// not. Order follows the walk, newest first.
+#[test]
+fn file_history_covers_adds_edits_and_first_parent_merges() {
+    let (_repo_dir, fixture) = TestRepo::build_standard_fixture();
+    let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
+
+    let history = repo
+        .file_history("src/lib.rs", 100)
+        .expect("walk the history of src/lib.rs");
+
+    let oids: Vec<&str> = history.iter().map(|c| c.oid.as_str()).collect();
+    assert_eq!(
+        oids,
+        vec![
+            fixture.merge.as_str(),
+            fixture.main_tip.as_str(),
+            fixture.base.as_str(),
+        ]
+    );
+}
+
+/// A file added on a side branch appears twice: once for the commit that
+/// added it, and once for the merge, where it is new relative to the merge's
+/// first parent. That is what `git log -- <path>` reports too.
+#[test]
+fn file_history_includes_a_side_branch_file_and_its_merge() {
+    let (_repo_dir, fixture) = TestRepo::build_standard_fixture();
+    let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
+
+    let history = repo
+        .file_history("src/feature.rs", 100)
+        .expect("walk the history of src/feature.rs");
+
+    let oids: Vec<&str> = history.iter().map(|c| c.oid.as_str()).collect();
+    assert_eq!(oids, vec![fixture.merge.as_str(), fixture.feature.as_str()]);
+}
+
+/// `max_count` bounds matches, not walk steps: the walk keeps going past
+/// non-matching commits until it has that many hits.
+#[test]
+fn file_history_stops_after_max_count_matches() {
+    let (_repo_dir, fixture) = TestRepo::build_standard_fixture();
+    let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
+
+    let history = repo
+        .file_history("src/lib.rs", 2)
+        .expect("walk the history of src/lib.rs");
+
+    let oids: Vec<&str> = history.iter().map(|c| c.oid.as_str()).collect();
+    assert_eq!(
+        oids,
+        vec![fixture.merge.as_str(), fixture.main_tip.as_str()]
+    );
+}
+
+/// A path no commit ever contained is empty rather than an error: the pane
+/// reports "nothing touched this" instead of a libgit2 failure.
+#[test]
+fn file_history_of_an_unknown_path_is_empty() {
+    let (_repo_dir, fixture) = TestRepo::build_standard_fixture();
+    let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
+
+    let history = repo
+        .file_history("does/not/exist.txt", 100)
+        .expect("an unknown path is not an error");
+    assert!(history.is_empty());
+}
+
+/// The filtered list feeds the same panes as full history, so it has to lay
+/// out as graph rows. Its commits are not neighbours in the real graph, which
+/// is why `build_linear` exists.
+#[test]
+fn file_history_lays_out_as_one_row_per_commit() {
+    let (_repo_dir, fixture) = TestRepo::build_standard_fixture();
+    let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
+
+    let history = repo
+        .file_history("src/lib.rs", 100)
+        .expect("walk the history of src/lib.rs");
+    let rows = GraphEngine::build_linear(&history);
+
+    assert_eq!(rows.len(), history.len());
+    for (row, commit) in rows.iter().zip(history.iter()) {
+        assert_eq!(row.commit_oid, commit.oid);
+        assert_eq!(row.node_lane, 0);
+    }
+}

@@ -1,3 +1,4 @@
+use crate::app::detail::{DetailWorker, Payload, Request};
 use crate::app::loading::{self, LoadMessage, LoadingState};
 use crate::git::commit::CommitInfo;
 use crate::git::repository::{Branch, GitRepository, Ref, RefName, RepoInfo, RepoRefs};
@@ -9,7 +10,54 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use unicode_width::UnicodeWidthStr;
 
 use crate::git::commit::CommitDetails;
-use crate::graph::layout::GraphRow;
+use crate::graph::layout::{GraphEngine, GraphRow};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryScope {
+    /// Everything reachable from HEAD, as loaded at startup.
+    All,
+    /// Only the commits that touched this path.
+    File(String),
+}
+
+/// A one-line message for the bottom bar.
+///
+/// The two cases are distinguished because the bar used to be error-only and
+/// painted red unconditionally; now that a successful `y` reports through the
+/// same field, "sent to clipboard" in red would read as a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    /// Something worked, and said so.
+    Notice(String),
+    /// Something failed, in a way a key press would otherwise have swallowed. :(
+    Error(String),
+}
+
+impl Status {
+    pub fn text(&self) -> &str {
+        match self {
+            Status::Notice(text) | Status::Error(text) => text,
+        }
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(self, Status::Error(_))
+    }
+}
+
+/// The full history, parked while a single file's history is on screen.
+///
+/// Scoping to a file replaces the commit list rather than filtering a view of
+/// it, because the graph rows, the minimap and the selection are all index
+/// aligned with `commits` and would otherwise need to be recomputed on the way
+/// back. Holding one copy costs memory only while scoped, and it is dropped the
+/// moment full history is restored.
+struct HistorySnapshot {
+    commits: Vec<CommitInfo>,
+    graph_rows: Vec<GraphRow>,
+    minimap: Vec<char>,
+    selected: Option<usize>,
+}
 
 /// One row of the refs pane: a non-selectable section header, a branch entry or
 /// a tag entry.
@@ -90,6 +138,9 @@ pub struct AppState {
     pub details_scroll_x: u16,
     pub view_mode: ViewMode,
     pub changed_files: Vec<String>,
+    /// Selection in the CHANGED FILES pane. The pane is a list rather than a
+    /// paragraph so a path can be picked and its history opened with `l`.
+    pub files_list_state: ListState,
     pub diff_lines: Vec<String>,
     pub refs: Option<RepoRefs>,
     /// `refs` flattened into header/entry rows, rebuilt whenever `refs` is.
@@ -112,13 +163,26 @@ pub struct AppState {
     pub loading: Option<LoadingState>,
     /// Progress channel from the loading thread, dropped when the load ends.
     load_rx: Option<Receiver<LoadMessage>>,
+    /// Detail/files/diff/file-history fetches, run off the UI thread. `None`
+    /// only when no repository could be opened at all.
+    detail: Option<DetailWorker>,
+    /// Which commits the graph pane is currently showing.
+    pub history: HistoryScope,
+    /// Full history, parked while `history` is scoped to a file.
+    saved_history: Option<Box<HistorySnapshot>>,
+    /// Whether the `?` keymap overlay is up. Independent of `view_mode` so
+    /// dismissing it returns to whatever pane was underneath.
+    pub show_help: bool,
+    /// Last-rendered inner area of the graph pane, recorded by `ui::render` so
+    /// PageUp/PageDown move by the number of rows actually on screen.
+    pub graph_pane: Rect,
     /// Last-rendered inner area of the details/files/diff/refs pane, updated
     /// by `ui::render` every frame. Scroll clamping reads real geometry from
     /// here instead of re-deriving it from `crossterm::terminal::size()` and
     /// the layout percentages baked into `ui::mod`.
     pub details_pane: Rect,
-    /// Short status/error message shown in the bottom bar.
-    pub status: Option<String>,
+    /// Short message shown in the bottom bar, red for errors.
+    pub status: Option<Status>,
 }
 
 impl Default for AppState {
@@ -132,7 +196,7 @@ impl AppState {
         let search_path =
             path.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        let (repo_state, loading, load_rx) = match GitRepository::open(&search_path) {
+        let (repo_state, loading, load_rx, detail) = match GitRepository::open(&search_path) {
             Ok(repo) => {
                 let git_dir = repo.path();
                 let load_rx = loading::spawn(git_dir.clone());
@@ -141,9 +205,10 @@ impl AppState {
                     RepoState::Loading(repo),
                     Some(LoadingState::new(label)),
                     Some(load_rx),
+                    Some(DetailWorker::spawn(git_dir)),
                 )
             }
-            Err(e) => (RepoState::Error(e.message().to_string()), None, None),
+            Err(e) => (RepoState::Error(e.message().to_string()), None, None, None),
         };
 
         Self {
@@ -157,6 +222,7 @@ impl AppState {
             details_scroll_x: 0,
             view_mode: ViewMode::Graph,
             changed_files: Vec::new(),
+            files_list_state: ListState::default(),
             diff_lines: Vec::new(),
             refs: None,
             refs_rows: Vec::new(),
@@ -169,13 +235,42 @@ impl AppState {
             minimap: Vec::new(),
             loading,
             load_rx,
+            detail,
+            history: HistoryScope::All,
+            saved_history: None,
+            show_help: false,
+            graph_pane: Rect::default(),
             details_pane: Rect::default(),
             status: None,
         }
     }
 
+    /// True while anything is running that will change the screen without a
+    /// keypress: the initial load, or an in-flight detail fetch. The main loop
+    /// polls with a timeout while this holds instead of blocking on input, so
+    /// results appear as they land.
+    pub fn is_busy(&self) -> bool {
+        self.is_loading() || self.detail.as_ref().is_some_and(DetailWorker::is_busy)
+    }
+
+    /// Placeholder text for a pane whose contents are still being fetched.
+    pub fn pending_label(&self) -> Option<&'static str> {
+        self.detail
+            .as_ref()
+            .and_then(DetailWorker::pending)
+            .map(Request::pending_label)
+    }
+
     pub fn is_loading(&self) -> bool {
         self.loading.is_some()
+    }
+
+    fn notice(&mut self, message: impl Into<String>) {
+        self.status = Some(Status::Notice(message.into()));
+    }
+
+    fn error(&mut self, message: impl Into<String>) {
+        self.status = Some(Status::Error(message.into()));
     }
 
     pub fn tick(&mut self) {
@@ -266,32 +361,236 @@ impl AppState {
         step_selection(&mut self.list_state, self.commits.len(), -1);
     }
 
-    pub fn load_details(&mut self) {
-        let Some(idx) = self.list_state.selected() else {
+    /// Move the commit selection and pull the open pane along with it, so a
+    /// diff or file list can be walked commit by commit without closing it.
+    /// Bound to `J`/`K`, leaving `j`/`k` to scroll the pane's own contents.
+    pub fn step_commit_and_follow(&mut self, direction: i32) {
+        if self.commits.is_empty() {
             return;
-        };
-        let Some(commit) = self.commits.get(idx) else {
-            return;
-        };
-        let RepoState::Loaded(repo, _) = &self.repo_state else {
-            self.status = Some("No repository loaded".to_string());
-            return;
-        };
-        match repo.commit_details(&commit.oid) {
-            Ok(details) => {
-                self.commit_details = Some(details);
-                self.view_mode = ViewMode::Details;
+        }
+        step_selection(&mut self.list_state, self.commits.len(), direction);
+        self.refresh_view();
+    }
+
+    /// `g`: the top of whatever currently has focus.
+    ///
+    /// `g`, `G` and the page keys dispatch on the view mode here rather than
+    /// through four key-table arms each, because they mean one thing ("the top
+    /// of the focused pane") that every pane can answer. The graph arms don't
+    /// refresh the open pane, for the same reason `j`/`k` don't: reaching them
+    /// means the graph *is* the focused pane. `J`/`K` is the binding that moves
+    /// the selection with a pane in tow.
+    pub fn go_first(&mut self) {
+        match self.view_mode {
+            ViewMode::Graph => {
+                if !self.commits.is_empty() {
+                    self.list_state.select(Some(0));
+                }
+            }
+            ViewMode::Refs => {
+                let first = self.refs_rows.iter().position(|r| !r.is_header());
+                if let Some(first) = first {
+                    self.refs_list_state.select(Some(first));
+                }
+            }
+            ViewMode::Files => {
+                if !self.changed_files.is_empty() {
+                    self.files_list_state.select(Some(0));
+                }
+            }
+            ViewMode::Details | ViewMode::Diff => {
                 self.details_scroll = 0;
                 self.details_scroll_x = 0;
-                self.status = None;
             }
-            Err(e) => self.status = Some(format!("Failed to load commit details: {e}")),
+        }
+    }
+
+    /// `G`: the bottom of whatever currently has focus.
+    pub fn go_last(&mut self) {
+        match self.view_mode {
+            ViewMode::Graph => {
+                if !self.commits.is_empty() {
+                    self.list_state.select(Some(self.commits.len() - 1));
+                }
+            }
+            ViewMode::Refs => {
+                let last = self.refs_rows.iter().rposition(|r| !r.is_header());
+                if let Some(last) = last {
+                    self.refs_list_state.select(Some(last));
+                }
+            }
+            ViewMode::Files => {
+                if !self.changed_files.is_empty() {
+                    self.files_list_state
+                        .select(Some(self.changed_files.len() - 1));
+                }
+            }
+            ViewMode::Details | ViewMode::Diff => {
+                let (lines, _) = self.content_dimensions();
+                self.details_scroll = lines.saturating_sub(self.details_pane.height);
+            }
+        }
+    }
+
+    /// PageDown (`direction > 0`) and PageUp: a screenful of the focused pane.
+    pub fn page(&mut self, direction: i32) {
+        match self.view_mode {
+            ViewMode::Graph => {
+                if self.commits.is_empty() {
+                    return;
+                }
+                let page = page_size(self.graph_pane.height);
+                let last = self.commits.len() - 1;
+                let current = self.list_state.selected().unwrap_or(0);
+                let target = if direction > 0 {
+                    current.saturating_add(page).min(last)
+                } else {
+                    current.saturating_sub(page)
+                };
+                self.list_state.select(Some(target));
+            }
+            ViewMode::Refs => {
+                // Stepping repeatedly reuses the header-skipping logic instead
+                // of re-deriving which row a page jump lands on.
+                for _ in 0..page_size(self.details_pane.height) {
+                    step_selection_skipping(
+                        &mut self.refs_list_state,
+                        &self.refs_rows,
+                        direction,
+                        |r| r.is_header(),
+                    );
+                }
+            }
+            ViewMode::Files => {
+                if self.changed_files.is_empty() {
+                    return;
+                }
+                let page = page_size(self.details_pane.height);
+                let last = self.changed_files.len() - 1;
+                let current = self.files_list_state.selected().unwrap_or(0);
+                let target = if direction > 0 {
+                    current.saturating_add(page).min(last)
+                } else {
+                    current.saturating_sub(page)
+                };
+                self.files_list_state.select(Some(target));
+            }
+            ViewMode::Details | ViewMode::Diff => {
+                let page = page_size(self.details_pane.height) as u16;
+                if direction > 0 {
+                    let (lines, _) = self.content_dimensions();
+                    let max_scroll = lines.saturating_sub(self.details_pane.height);
+                    self.details_scroll = self.details_scroll.saturating_add(page).min(max_scroll);
+                } else {
+                    self.details_scroll = self.details_scroll.saturating_sub(page);
+                }
+            }
+        }
+    }
+
+    pub fn next_file(&mut self) {
+        step_selection(&mut self.files_list_state, self.changed_files.len(), 1);
+    }
+
+    pub fn previous_file(&mut self) {
+        step_selection(&mut self.files_list_state, self.changed_files.len(), -1);
+    }
+
+    /// Ask the terminal to copy the selected commit's full OID.
+    ///
+    /// The status message says "sent to clipboard" rather than "copied"
+    /// deliberately: OSC 52 gives no acknowledgement, so a terminal that
+    /// ignores it would make a flat "copied" a lie. See [`crate::clipboard`].
+    pub fn yank_selected_oid(&mut self) {
+        let Some(oid) = self.selected_oid() else {
+            self.error("No commit selected");
+            return;
+        };
+        match crate::clipboard::copy(&oid) {
+            Ok(()) => {
+                let short = &oid[..7.min(oid.len())];
+                self.notice(format!("{short} sent to clipboard"));
+            }
+            Err(e) => self.error(format!("Failed to write to the terminal: {e}")),
+        }
+    }
+
+    /// The selected commit's oid, cloned so callers don't hold a borrow of
+    /// `self` while mutating other fields.
+    fn selected_oid(&self) -> Option<String> {
+        let index = self.list_state.selected()?;
+        Some(self.commits.get(index)?.oid.clone())
+    }
+
+    /// Hand `request` to the detail thread, reporting rather than silently
+    /// doing nothing if there is nothing to hand it to.
+    fn request(&mut self, request: Request) -> bool {
+        let Some(detail) = &mut self.detail else {
+            self.error("No repository loaded");
+            return false;
+        };
+        if !detail.request(request) {
+            self.error("Detail worker stopped");
+            return false;
+        }
+        self.status = None;
+        true
+    }
+
+    /// Apply whatever the detail thread has finished, if anything. Called from
+    /// the main loop next to [`AppState::poll_load`].
+    pub fn poll_detail(&mut self) {
+        let Some(detail) = &mut self.detail else {
+            return;
+        };
+        let Some(result) = detail.poll() else {
+            return;
+        };
+        match result {
+            Ok(payload) => self.apply_payload(payload),
+            Err(err) => self.error(err),
+        }
+    }
+
+    fn apply_payload(&mut self, payload: Payload) {
+        match payload {
+            Payload::Details(details) => self.commit_details = Some(*details),
+            Payload::Files(files) => {
+                self.files_list_state
+                    .select((!files.is_empty()).then_some(0));
+                self.changed_files = files;
+            }
+            Payload::Diff(lines) => self.diff_lines = lines,
+            Payload::FileHistory { path, commits } => self.enter_file_history(path, commits),
+        }
+    }
+
+    /// Request the selected commit's details and switch to the Details pane.
+    ///
+    /// The previous commit's content is dropped rather than left on screen
+    /// under the new commit's heading; the pane shows a placeholder until the
+    /// fetch lands. All three of these used to call libgit2 inline, which is
+    /// what made a large commit freeze the terminal.
+    pub fn load_details(&mut self) {
+        let Some(oid) = self.selected_oid() else {
+            return;
+        };
+        if self.request(Request::Details(oid)) {
+            self.view_mode = ViewMode::Details;
+            self.commit_details = None;
+            self.details_scroll = 0;
+            self.details_scroll_x = 0;
         }
     }
 
     pub fn close_details(&mut self) {
         self.view_mode = ViewMode::Graph;
         self.status = None;
+        // A fetch still in flight would otherwise repaint a pane the user has
+        // just closed.
+        if let Some(detail) = &mut self.detail {
+            detail.cancel();
+        }
     }
 
     /// Content dimensions of the details pane for the current view mode, as
@@ -315,19 +614,14 @@ impl AppState {
                     (0, 0)
                 }
             }
-            ViewMode::Files => (
-                self.changed_files.len() as u16,
-                self.changed_files
-                    .iter()
-                    .map(|s| s.width())
-                    .max()
-                    .unwrap_or(0) as u16,
-            ),
             ViewMode::Diff => (
                 self.diff_lines.len() as u16,
                 self.diff_lines.iter().map(|s| s.width()).max().unwrap_or(0) as u16,
             ),
-            ViewMode::Graph | ViewMode::Refs => (0, 0),
+            // The graph, refs and changed-files panes are lists: they track a
+            // selection and let `List` handle its own offset, so there is no
+            // scroll offset here to clamp.
+            ViewMode::Graph | ViewMode::Refs | ViewMode::Files => (0, 0),
         }
     }
 
@@ -359,49 +653,104 @@ impl AppState {
     }
 
     pub fn load_files(&mut self) {
-        let Some(idx) = self.list_state.selected() else {
+        let Some(oid) = self.selected_oid() else {
             return;
         };
-        let Some(commit) = self.commits.get(idx) else {
-            return;
-        };
-        let RepoState::Loaded(repo, _) = &self.repo_state else {
-            self.status = Some("No repository loaded".to_string());
-            return;
-        };
-        match repo.changed_files(&commit.oid) {
-            Ok(files) => {
-                self.changed_files = files;
-                self.view_mode = ViewMode::Files;
-                self.details_scroll = 0;
-                self.details_scroll_x = 0;
-                self.status = None;
-            }
-            Err(e) => self.status = Some(format!("Failed to load changed files: {e}")),
+        if self.request(Request::Files(oid)) {
+            self.view_mode = ViewMode::Files;
+            self.changed_files = Vec::new();
+            self.files_list_state.select(None);
+            self.details_scroll = 0;
+            self.details_scroll_x = 0;
         }
     }
 
     pub fn load_diff(&mut self) {
-        let Some(idx) = self.list_state.selected() else {
+        let Some(oid) = self.selected_oid() else {
             return;
         };
-        let Some(commit) = self.commits.get(idx) else {
-            return;
-        };
-        let RepoState::Loaded(repo, _) = &self.repo_state else {
-            self.status = Some("No repository loaded".to_string());
-            return;
-        };
-        match repo.commit_diff(&commit.oid) {
-            Ok(lines) => {
-                self.diff_lines = lines;
-                self.view_mode = ViewMode::Diff;
-                self.details_scroll = 0;
-                self.details_scroll_x = 0;
-                self.status = None;
-            }
-            Err(e) => self.status = Some(format!("Failed to load diff: {e}")),
+        if self.request(Request::Diff(oid)) {
+            self.view_mode = ViewMode::Diff;
+            self.diff_lines = Vec::new();
+            self.details_scroll = 0;
+            self.details_scroll_x = 0;
         }
+    }
+
+    /// Scope the graph pane to the history of the file selected in the CHANGED
+    /// FILES pane. Bound to `l` there, where there is no horizontal scrolling
+    /// to conflict with.
+    pub fn open_file_history(&mut self) {
+        let Some(path) = self
+            .files_list_state
+            .selected()
+            .and_then(|index| self.changed_files.get(index))
+            .cloned()
+        else {
+            self.error("No file selected");
+            return;
+        };
+        self.request(Request::FileHistory {
+            path,
+            max_count: loading::COMMIT_LIMIT,
+        });
+    }
+
+    /// Swap the graph pane over to a single file's history, parking the full
+    /// history so `Esc` can put it back.
+    fn enter_file_history(&mut self, path: String, commits: Vec<CommitInfo>) {
+        if commits.is_empty() {
+            self.error(format!("No commits in this history touched {path}"));
+            return;
+        }
+
+        // Only the first scoping saves a snapshot. Jumping straight from one
+        // file's history to another must not overwrite it with an already
+        // scoped list, or `Esc` would land on the previous file rather than on
+        // full history.
+        if self.saved_history.is_none() {
+            self.saved_history = Some(Box::new(HistorySnapshot {
+                commits: std::mem::take(&mut self.commits),
+                graph_rows: std::mem::take(&mut self.graph_rows),
+                minimap: std::mem::take(&mut self.minimap),
+                selected: self.list_state.selected(),
+            }));
+        }
+
+        // Linear rows, not `GraphEngine::build`: see `build_linear` for why a
+        // filtered list cannot be laid out as a graph.
+        self.graph_rows = GraphEngine::build_linear(&commits);
+        self.commits = commits;
+        // The minimap is deliberately empty while scoped. Commit sizes come
+        // from the background size pass over the full list, and re-running it
+        // for a subset would mean another walk for a decoration; `ui::render`
+        // already treats a missing entry as "no minimap column".
+        self.minimap = Vec::new();
+        self.history = HistoryScope::File(path);
+        self.list_state.select(Some(0));
+        self.view_mode = ViewMode::Graph;
+        self.search_results.clear();
+        self.search_index = 0;
+        self.status = None;
+    }
+
+    /// Restore full history. No-op when it is already showing, which is what
+    /// makes it safe to bind to `Esc` in the graph pane.
+    pub fn close_file_history(&mut self) -> bool {
+        let Some(saved) = self.saved_history.take() else {
+            return false;
+        };
+        let saved = *saved;
+        self.commits = saved.commits;
+        self.graph_rows = saved.graph_rows;
+        self.minimap = saved.minimap;
+        self.list_state.select(saved.selected);
+        self.history = HistoryScope::All;
+        self.search_results.clear();
+        self.search_index = 0;
+        self.view_mode = ViewMode::Graph;
+        self.status = None;
+        true
     }
 
     pub fn refresh_view(&mut self) {
@@ -417,7 +766,7 @@ impl AppState {
 
     pub fn load_refs(&mut self) {
         let RepoState::Loaded(repo, _) = &self.repo_state else {
-            self.status = Some("No repository loaded".to_string());
+            self.error("No repository loaded");
             return;
         };
         match repo.refs() {
@@ -431,7 +780,7 @@ impl AppState {
                 self.refs_list_state.select(first_entry.or(Some(0)));
                 self.status = None;
             }
-            Err(e) => self.status = Some(format!("Failed to load branches & tags: {e}")),
+            Err(e) => self.error(format!("Failed to load branches & tags: {e}")),
         }
     }
 
@@ -502,6 +851,13 @@ impl AppState {
     }
 }
 
+/// One row of overlap is kept so the line you were reading is still on screen
+/// after the jump, and the result is never zero: in a pane one or two rows tall
+/// a page key must still move, or it looks broken.
+fn page_size(height: u16) -> usize {
+    (height as usize).saturating_sub(1).max(1)
+}
+
 fn step_selection(state: &mut ListState, len: usize, step: i32) {
     if len == 0 {
         return;
@@ -570,4 +926,101 @@ fn repo_label(git_dir: &Path, search_path: &Path) -> String {
         .or_else(|| git_dir.file_name())
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| search_path.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_page_leaves_one_row_of_overlap() {
+        assert_eq!(page_size(20), 19);
+        assert_eq!(page_size(2), 1);
+    }
+
+    /// The bottom bar paints errors red, so a confirmation must not be one.
+    #[test]
+    fn a_notice_is_not_an_error() {
+        assert!(Status::Error("boom".into()).is_error());
+        assert!(!Status::Notice("3c4e053 sent to clipboard".into()).is_error());
+        assert_eq!(Status::Notice("hello".into()).text(), "hello");
+        assert_eq!(Status::Error("hello".into()).text(), "hello");
+    }
+
+    /// A pane can be one row tall, or zero before the first frame is drawn.
+    /// Either way a page key has to move at least one row.
+    #[test]
+    fn a_page_is_never_zero_rows() {
+        assert_eq!(page_size(1), 1);
+        assert_eq!(page_size(0), 1);
+    }
+
+    #[test]
+    fn ref_pane_rows_puts_every_ref_under_its_own_header() {
+        let refs = RepoRefs {
+            branches: vec![
+                Branch::Local(RefName::new("main")),
+                Branch::Remote(RefName::new("origin/main")),
+            ],
+            tags: vec![RefName::new("v0.1.0")],
+        };
+
+        let rows = ref_pane_rows(&refs);
+
+        assert_eq!(
+            rows,
+            vec![
+                RefPaneRow::Header("Local Branches"),
+                RefPaneRow::Branch(Branch::Local(RefName::new("main"))),
+                RefPaneRow::Header("Remote Branches"),
+                RefPaneRow::Branch(Branch::Remote(RefName::new("origin/main"))),
+                RefPaneRow::Header("Tags"),
+                RefPaneRow::Tag(RefName::new("v0.1.0")),
+            ]
+        );
+    }
+
+    /// Empty sections keep their headers so the pane doesn't reshuffle as
+    /// branches come and go.
+    #[test]
+    fn ref_pane_rows_keeps_headers_for_empty_sections() {
+        let rows = ref_pane_rows(&RepoRefs {
+            branches: Vec::new(),
+            tags: Vec::new(),
+        });
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(RefPaneRow::is_header));
+    }
+
+    #[test]
+    fn stepping_skips_headers_in_both_directions() {
+        let rows = ref_pane_rows(&RepoRefs {
+            branches: vec![Branch::Local(RefName::new("main"))],
+            tags: vec![RefName::new("v1")],
+        });
+        // rows: [Header, main, Header, Header, v1]
+        let mut state = ListState::default();
+        state.select(Some(1));
+
+        step_selection_skipping(&mut state, &rows, 1, |r| r.is_header());
+        assert_eq!(state.selected(), Some(4), "jumped over two headers");
+
+        step_selection_skipping(&mut state, &rows, -1, |r| r.is_header());
+        assert_eq!(state.selected(), Some(1), "and back again");
+    }
+
+    /// At the end of the list there is nothing selectable left, so the
+    /// selection must stay put rather than landing on a header.
+    #[test]
+    fn stepping_past_the_last_entry_keeps_the_selection() {
+        let rows = ref_pane_rows(&RepoRefs {
+            branches: vec![Branch::Local(RefName::new("main"))],
+            tags: Vec::new(),
+        });
+        let mut state = ListState::default();
+        state.select(Some(1));
+
+        step_selection_skipping(&mut state, &rows, 1, |r| r.is_header());
+        assert_eq!(state.selected(), Some(1));
+    }
 }

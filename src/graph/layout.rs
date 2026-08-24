@@ -320,6 +320,33 @@ impl GraphEngine {
         let mut engine = Self::new();
         commits.iter().map(|c| engine.process(c)).collect()
     }
+
+    /// One node per commit in a single lane, for *filtered* histories.
+    ///
+    /// [`GraphEngine::build`] must not be used on a filtered list. A lane is
+    /// held open until the commit it is waiting for arrives, so when a commit's
+    /// real parents have been filtered out, their lanes are never claimed: each
+    /// commit takes a fresh lane and the graph widens into a staircase one lane
+    /// per row. A single-path history filters out nearly every parent, so that
+    /// is the normal case there, not an edge case.
+    ///
+    /// Drawing the filtered list as a straight line is also the honest
+    /// rendering: consecutive rows are ancestors, but usually not parent and
+    /// child, so no branch or merge topology between them can be shown. This is
+    /// the same simplification `git log -- <path>` makes without `--graph`.
+    pub fn build_linear(commits: &[CommitInfo]) -> Vec<GraphRow> {
+        commits
+            .iter()
+            .map(|c| GraphRow {
+                commit_oid: c.oid.clone(),
+                segments: vec![GraphSegment {
+                    lane: 0,
+                    glyph: GlyphType::Node,
+                }],
+                node_lane: 0,
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -404,5 +431,48 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A file's history is a subset of the walk, so consecutive rows are
+    /// usually not parent and child. Every row stays in lane 0 rather than
+    /// claiming a new one.
+    #[test]
+    fn a_filtered_history_stays_in_one_lane() {
+        let commits = vec![
+            make_commit("9", &["8"]),
+            make_commit("5", &["4"]),
+            make_commit("1", &[]),
+        ];
+        let rows = GraphEngine::build_linear(&commits);
+
+        assert_eq!(rows.len(), 3);
+        for (row, commit) in rows.iter().zip(commits.iter()) {
+            assert_eq!(row.commit_oid, commit.oid);
+            assert_eq!(row.node_lane, 0);
+            assert_eq!(row.render_plain(), "●");
+        }
+    }
+
+    /// The failure `build_linear` exists to avoid: fed the same gapped list,
+    /// the graph engine widens by a lane per row because the parents it is
+    /// waiting for never arrive.
+    #[test]
+    fn the_graph_engine_would_widen_on_the_same_list() {
+        let commits = vec![
+            make_commit("9", &["8"]),
+            make_commit("5", &["4"]),
+            make_commit("1", &[]),
+        ];
+        let rows = GraphEngine::build(&commits);
+        assert!(
+            rows[2].node_lane > 0,
+            "expected a staircase, got lane {}",
+            rows[2].node_lane
+        );
+    }
+
+    #[test]
+    fn an_empty_filtered_history_has_no_rows() {
+        assert!(GraphEngine::build_linear(&[]).is_empty());
     }
 }

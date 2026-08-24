@@ -98,23 +98,8 @@ impl GitRepository {
 
         let mut commits = Vec::new();
         for oid in revwalk.take(max_count) {
-            let oid = oid?;
-            let commit = self.repo.find_commit(oid)?;
-
-            let parents = commit.parent_ids().map(|id| id.to_string()).collect();
-            let author = commit.author().name().unwrap_or("unknown").to_string();
-            let timestamp = commit.time().seconds();
-            let summary = commit.summary().unwrap_or(None).unwrap_or("").to_string();
-            let message = commit.message().unwrap_or("").to_string();
-
-            commits.push(crate::git::commit::CommitInfo {
-                oid: oid.to_string(),
-                parents,
-                author,
-                timestamp,
-                summary,
-                message,
-            });
+            let commit = self.repo.find_commit(oid?)?;
+            commits.push(commit_info(&commit));
 
             if commits.len().is_multiple_of(PROGRESS_INTERVAL) && !on_progress(commits.len()) {
                 return Ok(commits);
@@ -122,6 +107,68 @@ impl GitRepository {
         }
         on_progress(commits.len());
         Ok(commits)
+    }
+
+    /// The commits that touched `path`, newest first, capped at `max_count`.
+    ///
+    /// Shaped exactly like [`GitRepository::commits`] so the graph engine, the
+    /// minimap and every pane consume a file's history through the same code
+    /// path as full history; the app swaps one `Vec<CommitInfo>` for another.
+    ///
+    /// Unlike `commits`, `max_count` cannot bound the walk itself: whether a
+    /// commit qualifies is only known after diffing it, so the walk runs until
+    /// `max_count` *matches* are found or history ends. On a large repository
+    /// and a rarely-touched file that means walking a long way, which is why
+    /// this is called from the background loader rather than the UI thread.
+    ///
+    /// A merge is included only when it changed `path` against its *first*
+    /// parent, matching `git log -- <path>`'s default simplification rather
+    /// than `--full-history`: merges that only carry a side branch's edit
+    /// through are left out instead of appearing as duplicates.
+    pub fn file_history(
+        &self,
+        path: &str,
+        max_count: usize,
+    ) -> Result<Vec<crate::git::commit::CommitInfo>, git2::Error> {
+        let path = Path::new(path);
+        let mut revwalk = self.repo.revwalk()?;
+        revwalk.push_head()?;
+        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+
+        let mut commits = Vec::new();
+        for oid in revwalk {
+            let commit = self.repo.find_commit(oid?)?;
+            if self.commit_touches(&commit, path)? {
+                commits.push(commit_info(&commit));
+                if commits.len() >= max_count {
+                    break;
+                }
+            }
+        }
+        Ok(commits)
+    }
+
+    /// Whether `commit` changed `path` relative to its first parent. A root
+    /// commit is compared against the empty tree, so adding the file counts.
+    ///
+    /// This compares the blob oid at `path` in the two trees instead of
+    /// diffing them. A tree diff walks both trees whole even with a pathspec
+    /// set, and this runs once per commit in the history; looking the single
+    /// entry up costs one step per path component. It is also the comparison
+    /// `git log -- <path>` makes (the TREESAME test), so the result matches.
+    ///
+    /// The cost is that `path` must name an exact entry: no globs, and a
+    /// directory only matches if the tree stores it as one entry. Paths reach
+    /// here from a commit's changed-files list, which is always exact.
+    fn commit_touches(&self, commit: &git2::Commit<'_>, path: &Path) -> Result<bool, git2::Error> {
+        let current = entry_oid(&commit.tree()?, path)?;
+        if commit.parent_count() == 0 {
+            // Nothing to compare against: a root commit introduces whatever
+            // it contains.
+            return Ok(current.is_some());
+        }
+        let parent = entry_oid(&commit.parent(0)?.tree()?, path)?;
+        Ok(current != parent)
     }
 
     pub fn commit_details(
@@ -211,6 +258,37 @@ impl GitRepository {
             true
         })?;
         Ok(lines)
+    }
+}
+
+/// Snapshot a `git2::Commit` into the owned [`CommitInfo`] the app works with.
+///
+/// Shared by full-history and single-file walks so the two can't drift in what
+/// they record about a commit.
+///
+/// [`CommitInfo`]: crate::git::commit::CommitInfo
+fn commit_info(commit: &git2::Commit<'_>) -> crate::git::commit::CommitInfo {
+    crate::git::commit::CommitInfo {
+        oid: commit.id().to_string(),
+        parents: commit.parent_ids().map(|id| id.to_string()).collect(),
+        author: commit.author().name().unwrap_or("unknown").to_string(),
+        timestamp: commit.time().seconds(),
+        summary: commit.summary().unwrap_or(None).unwrap_or("").to_string(),
+        message: commit.message().unwrap_or("").to_string(),
+    }
+}
+
+/// The blob oid stored at `path` in `tree`, or `None` when the tree has no
+/// such entry.
+///
+/// A missing path is an ordinary answer here (the file did not exist yet, or
+/// was deleted, like for real??), so libgit2's `NotFound` becomes `None`; any other error is
+/// still an error rather than being flattened into "absent".
+fn entry_oid(tree: &git2::Tree<'_>, path: &Path) -> Result<Option<git2::Oid>, git2::Error> {
+    match tree.get_path(path) {
+        Ok(entry) => Ok(Some(entry.id())),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
