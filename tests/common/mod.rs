@@ -42,6 +42,26 @@ pub struct Fixture {
     pub oids_newest_first: Vec<String>,
 }
 
+/// Git's tree mode for an executable blob, written as it appears in
+/// `git ls-tree` output.
+pub const EXECUTABLE: i32 = 0o100_755;
+
+/// Git's tree mode for an ordinary, non-executable blob.
+pub const REGULAR: i32 = 0o100_644;
+
+/// Oids of the mode-change fixture, built by
+/// [`TestRepo::build_mode_change_fixture`].
+pub struct ModeFixture {
+    pub repo_path: std::path::PathBuf,
+    /// Root commit; adds `script.sh` as a regular file.
+    pub added: String,
+    /// Adds `README.md` and leaves `script.sh` alone, so a file-history walk
+    /// has a commit it is expected to skip.
+    pub unrelated: String,
+    /// Marks `script.sh` executable without changing a byte of it.
+    pub chmod: String,
+}
+
 impl TestRepo {
     pub fn init() -> Self {
         let dir = tempfile::tempdir().expect("create temp dir for test repo");
@@ -151,6 +171,63 @@ impl TestRepo {
         oid.to_string()
     }
 
+    /// Commits a change to `relative_path`'s file mode, leaving its content
+    /// byte-identical, and returns the new commit's oid.
+    ///
+    /// The mode is set by rebuilding HEAD's tree rather than by touching the
+    /// worktree, because Windows has no executable bit: `index.add_path` reads
+    /// the mode off the filesystem there and would always produce `100644`, so
+    /// a fixture built that way would quietly become a no-op commit and any
+    /// test using it would pass for the wrong reason.
+    ///
+    /// `relative_path` must be a top-level name. `TreeBuilder` edits one tree,
+    /// so a nested path would need each parent tree rebuilt in turn, and no
+    /// fixture needs that yet.
+    fn commit_mode(&mut self, relative_path: &str, mode: i32, summary: &str) -> String {
+        assert!(
+            !relative_path.contains('/'),
+            "commit_mode only handles top-level paths, got `{relative_path}`"
+        );
+        // Before any borrow of `self.repo`: `next_timestamp` takes `&mut self`.
+        let ts = self.next_timestamp();
+
+        let head_commit = self
+            .repo
+            .head()
+            .expect("HEAD exists before a mode change")
+            .peel_to_commit()
+            .expect("HEAD peels to a commit");
+        let tree = head_commit.tree().expect("HEAD has a tree");
+        let entry = tree
+            .get_path(Path::new(relative_path))
+            .expect("the path being chmod-ed is already in HEAD's tree");
+
+        let mut builder = self
+            .repo
+            .treebuilder(Some(&tree))
+            .expect("open a treebuilder on HEAD's tree");
+        // Same oid, new mode: re-inserting replaces the entry in place.
+        builder
+            .insert(relative_path, entry.id(), mode)
+            .expect("re-insert the entry with a new mode");
+        let tree_oid = builder.write().expect("write the rebuilt tree");
+        let new_tree = self.repo.find_tree(tree_oid).expect("find rebuilt tree");
+
+        let sig = Self::signature_at(ts);
+        let oid = self
+            .repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                summary,
+                &new_tree,
+                &[&head_commit],
+            )
+            .expect("create mode-change commit");
+        oid.to_string()
+    }
+
     fn create_branch_at(&mut self, name: &str, target_oid: &str) {
         let oid = git2::Oid::from_str(target_oid).expect("parse oid for branch target");
         let commit = self
@@ -225,6 +302,32 @@ impl TestRepo {
             main_tip,
             feature,
             merge,
+        };
+        (repo, fixture)
+    }
+
+    /// A history in which one commit changes only a file's mode.
+    ///
+    /// Deliberately separate from [`TestRepo::build_standard_fixture`], whose
+    /// tests assert exact commit lists: adding a commit there would have meant
+    /// rewriting assertions that have nothing to do with file modes.
+    ///
+    /// Ordered so the chmod lands last. `commit_file` writes its tree from the
+    /// index, which knows nothing about a mode set through a `TreeBuilder`, so a
+    /// later `commit_file` would silently reset the mode to `100644` and turn
+    /// this fixture into *two* mode changes.
+    pub fn build_mode_change_fixture() -> (Self, ModeFixture) {
+        let mut repo = Self::init();
+
+        let added = repo.commit_file("script.sh", "#!/bin/sh\necho hi\n", "feat: add script");
+        let unrelated = repo.commit_file("README.md", "# Test Repo\n", "docs: add a readme");
+        let chmod = repo.commit_mode("script.sh", EXECUTABLE, "chore: make script executable");
+
+        let fixture = ModeFixture {
+            repo_path: repo.path().to_path_buf(),
+            added,
+            unrelated,
+            chmod,
         };
         (repo, fixture)
     }
