@@ -526,6 +526,61 @@ fn file_history_of_an_unknown_path_is_empty() {
     assert!(history.is_empty());
 }
 
+/// `chmod +x` leaves the blob byte-identical, so a comparison of blob oids
+/// alone would call the commit unchanged and drop it from the file's history —
+/// plausibly the very commit the user opened the pane on. Git compares the mode
+/// too, which is why `git log -- script.sh` lists it, and so does
+/// `file_history`.
+#[test]
+fn file_history_includes_a_mode_only_change() {
+    let (_repo_dir, fixture) = TestRepo::build_mode_change_fixture();
+    let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
+
+    let history = repo
+        .file_history("script.sh", 100)
+        .expect("walk the history of script.sh");
+
+    let oids: Vec<&str> = history.iter().map(|c| c.oid.as_str()).collect();
+    let expected = [fixture.chmod.as_str(), fixture.added.as_str()];
+    assert_eq!(
+        oids, expected,
+        "the chmod commit should appear, newest first, above the commit that added the file"
+    );
+    assert!(
+        !oids.contains(&fixture.unrelated.as_str()),
+        "a commit that never touched script.sh should still be skipped"
+    );
+}
+
+/// Guards the fixture, not the code: if the chmod commit ever stopped being
+/// mode-only, the test above would pass without proving anything. Asserts the
+/// blob is identical across the two commits and only the mode moved.
+#[test]
+fn the_mode_change_fixture_changes_only_the_mode() {
+    let (_repo_dir, fixture) = TestRepo::build_mode_change_fixture();
+    let repo = git2::Repository::open(&fixture.repo_path).expect("open fixture repo with git2");
+
+    let entry_at = |commit_oid: &str| {
+        let oid = git2::Oid::from_str(commit_oid).expect("parse commit oid");
+        let commit = repo.find_commit(oid).expect("find fixture commit");
+        let tree = commit.tree().expect("commit has a tree");
+        let entry = tree
+            .get_path(std::path::Path::new("script.sh"))
+            .expect("script.sh is in the tree");
+        (entry.id(), entry.filemode())
+    };
+
+    let (before_blob, before_mode) = entry_at(&fixture.added);
+    let (after_blob, after_mode) = entry_at(&fixture.chmod);
+
+    assert_eq!(
+        before_blob, after_blob,
+        "the chmod commit should not have touched the blob"
+    );
+    assert_eq!(before_mode, common::REGULAR);
+    assert_eq!(after_mode, common::EXECUTABLE);
+}
+
 /// The filtered list feeds the same panes as full history, so it has to lay
 /// out as graph rows. Its commits are not neighbours in the real graph, which
 /// is why `build_linear` exists.

@@ -151,23 +151,24 @@ impl GitRepository {
     /// Whether `commit` changed `path` relative to its first parent. A root
     /// commit is compared against the empty tree, so adding the file counts.
     ///
-    /// This compares the blob oid at `path` in the two trees instead of
-    /// diffing them. A tree diff walks both trees whole even with a pathspec
-    /// set, and this runs once per commit in the history; looking the single
-    /// entry up costs one step per path component. It is also the comparison
-    /// `git log -- <path>` makes (the TREESAME test), so the result matches.
+    /// This compares what the two trees store at `path` — object oid and file
+    /// mode, see [`entry_at`] — instead of diffing them. A tree diff walks both
+    /// trees whole even with a pathspec set, and this runs once per commit in
+    /// the history; looking the single entry up costs one step per path
+    /// component. It is also the comparison `git log -- <path>` makes (the
+    /// TREESAME test), so the result matches.
     ///
     /// The cost is that `path` must name an exact entry: no globs, and a
     /// directory only matches if the tree stores it as one entry. Paths reach
     /// here from a commit's changed-files list, which is always exact.
     fn commit_touches(&self, commit: &git2::Commit<'_>, path: &Path) -> Result<bool, git2::Error> {
-        let current = entry_oid(&commit.tree()?, path)?;
+        let current = entry_at(&commit.tree()?, path)?;
         if commit.parent_count() == 0 {
             // Nothing to compare against: a root commit introduces whatever
             // it contains.
             return Ok(current.is_some());
         }
-        let parent = entry_oid(&commit.parent(0)?.tree()?, path)?;
+        let parent = entry_at(&commit.parent(0)?.tree()?, path)?;
         Ok(current != parent)
     }
 
@@ -278,15 +279,22 @@ fn commit_info(commit: &git2::Commit<'_>) -> crate::git::commit::CommitInfo {
     }
 }
 
-/// The blob oid stored at `path` in `tree`, or `None` when the tree has no
-/// such entry.
+// The mode is half the answer, not decoration. `chmod +x script.sh` leaves the
+/// blob byte-identical, so comparing oids alone would call that commit
+/// unchanged and drop it from the file's history, which is very likely the
+/// commit the user opened the pane to look at. Git compares the mode too, which
+/// is why `git log -- script.sh` lists it.
 ///
-/// A missing path is an ordinary answer here (the file did not exist yet, or
-/// was deleted, like for real??), so libgit2's `NotFound` becomes `None`; any other error is
-/// still an error rather than being flattened into "absent".
-fn entry_oid(tree: &git2::Tree<'_>, path: &Path) -> Result<Option<git2::Oid>, git2::Error> {
+/// The mode also encodes the entry's *type*: a regular file replaced by a
+/// symlink, or by a submodule, differs in mode even where the bytes match, so
+/// one comparison covers both.
+///
+/// A missing path is an ordinary answer here (the file did not exist yet, or was
+/// deleted, like for real??), so libgit2's `NotFound` becomes `None`; any other error is still an
+/// error rather than being flattened into "absent".
+fn entry_at(tree: &git2::Tree<'_>, path: &Path) -> Result<Option<(git2::Oid, i32)>, git2::Error> {
     match tree.get_path(path) {
-        Ok(entry) => Ok(Some(entry.id())),
+        Ok(entry) => Ok(Some((entry.id(), entry.filemode()))),
         Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
         Err(e) => Err(e),
     }
