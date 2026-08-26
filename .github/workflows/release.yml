@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish (e.g. v0.1.0)'
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify the tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - name: Compare
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          crate=$(grep '^version' Cargo.toml | head -1 | tr -d '"' | cut -d' ' -f3)
+          if [ "$TAG" != "v$crate" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $crate"
+            exit 1
+          fi
+          echo "$TAG matches Cargo.toml version $crate"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing shouldn't discard three finished builds; the
+      # release job won't run, so nothing is published half-done.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # Cross-compiled from the arm64 runner rather than built on an Intel
+          # one: Xcode ships both SDKs, and it avoids depending on an older
+          # macOS image staying available.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --bin gitloom --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="gitloom-$TAG-$TARGET"
+          mkdir "$name"
+          cp README.md LICENSE "$name/"
+
+          # zip for Windows because that is what opens there without installing
+          # anything, tar.gz elsewhere for the same reason.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "target/$TARGET/release/gitloom.exe" "$name/"
+            7z a "$name.zip" "$name" >/dev/null
+            echo "asset=$name.zip" >> "$GITHUB_ENV"
+          else
+            cp "target/$TARGET/release/gitloom" "$name/"
+            tar czf "$name.tar.gz" "$name"
+            echo "asset=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.asset }}
+          path: ${{ env.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Attach the binaries to a draft release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum gitloom-* > SHA256SUMS
+          cat SHA256SUMS
+          
+      - name: Attach
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            if [ -f RELEASE_NOTES.md ]; then
+              notes=(--notes-file RELEASE_NOTES.md)
+            else
+              notes=(--generate-notes)
+            fi
+            gh release create "$TAG" --draft --verify-tag \
+              --title "GitLoom $TAG" "${notes[@]}"
+          fi
+
+          gh release upload "$TAG" artifacts/* --clobber
+
+          url=$(gh release view "$TAG" --json url --jq .url)
+          echo "Draft is ready — review and publish it here: $url" >> "$GITHUB_STEP_SUMMARY"
