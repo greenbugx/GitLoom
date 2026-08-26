@@ -1,10 +1,7 @@
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use gitloom::app::{AppState, ViewMode};
 use gitloom::cli::{self, Cli};
+use gitloom::terminal::{TerminalGuard, install_panic_hook};
 use gitloom::ui;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
@@ -47,24 +44,24 @@ fn main() -> ExitCode {
 }
 
 fn run(path: Option<std::path::PathBuf>) -> Result<(), Box<dyn Error>> {
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // Before the terminal is touched, and in this order: the hook records the
+    // calling thread as the terminal's owner, and installing it first means even
+    // a panic inside `enter` is reported on an intact screen.
+    install_panic_hook();
 
+    // Bound to a name rather than `_`: `let _ = ` drops a value immediately, so
+    // that spelling would leave raw mode before the first frame was drawn.
+    // Declared ahead of `terminal` so it is dropped after it.
+    let _guard = TerminalGuard::enter()?;
+
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut app_state = AppState::new(path);
 
-    let res = run_app(&mut terminal, &mut app_state);
-
-    // Restore the terminal before reporting anything, or an error message
-    // would be printed into the alternate screen and vanish with it.
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    res
+    // No teardown to write here. `_guard` covers the normal return, the `?`
+    // above, and a panic; the error travels up to `main`, which prints it after
+    // the guard has dropped, so it lands on the restored screen instead of
+    // inside the alternate one.
+    run_app(&mut terminal, &mut app_state)
 }
 
 fn run_app<B: ratatui::backend::Backend>(
