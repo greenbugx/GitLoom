@@ -83,12 +83,14 @@ A handful of rules are load-bearing, enforced by tests, and easy to trip over:
   being repopulated. Each has its own test in `src/app/detail.rs`; please don't
   collapse them into one mechanism.
 - **The terminal is restored by a `Drop` guard, not by code at the end of
-  `run`.** `main` holds it as `let _guard = TerminalGuard::enter()?`; the `_guard`
+  `run`.** `run` holds it as `let _guard = TerminalGuard::enter()?`; the `_guard`
   name is load-bearing, since `let _ = ` drops the value immediately and would
-  leave raw mode before the first frame. The panic hook restores only when the
-  thread that owns the terminal panics — a worker thread dying leaves the TUI
-  running, and pulling the screen out from under it would make a background
-  failure look like a rendering bug.
+  leave raw mode before the first frame. `enter` installs the panic hook itself
+  and only once per process (a `PANIC_HOOK_INSTALLED` flag no-ops a second
+  install), so the thread that owns the terminal is by construction the one
+  thread the hook restores for. It restores for that thread only — a worker
+  thread dying leaves the TUI running, and pulling the screen out from under it
+  would make a background failure look like a rendering bug.
 - **Line endings are LF.** `.gitattributes` normalizes on checkin. If you develop
   across Windows and a Linux container, review with
   `git diff --ignore-cr-at-eol` so real changes aren't buried in `^M`.
