@@ -28,10 +28,12 @@ does.
 
 **Entry point**
 
-- `src/main.rs`: Terminal setup, the main event loop, and the single
-  `(view_mode, key)` table that every binding lives in.
+- `src/main.rs`: The main event loop, and the single `(view_mode, key)` table
+  that every binding lives in.
 - `src/cli.rs`: Argument parsing, hand-rolled and dependency-free. Runs before
   the terminal enters raw mode so `--help` prints to a normal screen.
+- `src/terminal.rs`: Raw mode and the alternate screen, entered through an RAII
+  guard so they are undone on every exit path, panics included.
 
 **Application state**
 
@@ -80,6 +82,13 @@ A handful of rules are load-bearing, enforced by tests, and easy to trip over:
   repainting a pane the user has already left, and `cancel()` stops a closed pane
   being repopulated. Each has its own test in `src/app/detail.rs`; please don't
   collapse them into one mechanism.
+- **The terminal is restored by a `Drop` guard, not by code at the end of
+  `run`.** `main` holds it as `let _guard = TerminalGuard::enter()?`; the `_guard`
+  name is load-bearing, since `let _ = ` drops the value immediately and would
+  leave raw mode before the first frame. The panic hook restores only when the
+  thread that owns the terminal panics — a worker thread dying leaves the TUI
+  running, and pulling the screen out from under it would make a background
+  failure look like a rendering bug.
 - **Line endings are LF.** `.gitattributes` normalizes on checkin. If you develop
   across Windows and a Linux container, review with
   `git diff --ignore-cr-at-eol` so real changes aren't buried in `^M`.
