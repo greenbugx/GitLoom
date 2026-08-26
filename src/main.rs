@@ -1,7 +1,7 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use gitloom::app::{AppState, ViewMode};
 use gitloom::cli::{self, Cli};
-use gitloom::terminal::{TerminalGuard, install_panic_hook};
+use gitloom::terminal::TerminalGuard;
 use gitloom::ui;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
@@ -44,14 +44,10 @@ fn main() -> ExitCode {
 }
 
 fn run(path: Option<std::path::PathBuf>) -> Result<(), Box<dyn Error>> {
-    // Before the terminal is touched, and in this order: the hook records the
-    // calling thread as the terminal's owner, and installing it first means even
-    // a panic inside `enter` is reported on an intact screen.
-    install_panic_hook();
-
     // Bound to a name rather than `_`: `let _ = ` drops a value immediately, so
     // that spelling would leave raw mode before the first frame was drawn.
-    // Declared ahead of `terminal` so it is dropped after it.
+    // Declared ahead of `terminal` so it is dropped after it. `enter` installs
+    // the panic hook itself, so there is no ordering here left to get wrong.
     let _guard = TerminalGuard::enter()?;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;

@@ -18,13 +18,24 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set the first time `install_panic_hook` runs, never after. Guards against
+/// a second `TerminalGuard::enter()` call installing a second hook that
+/// wraps the first which would run two teardown attempts and print the
+/// panic message twice.
+static PANIC_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Owns the terminal's raw mode and alternate screen for as long as it lives.
 ///
 /// `main` holds one for the lifetime of the TUI. Because the teardown is in
 /// [`Drop`] rather than at the end of a function, it also runs on the paths that
 /// used to be missed: a `?` returning early, and a panic unwinding.
-pub struct TerminalGuard;
+///
+/// Exactly one of these should exist per process — see `PANIC_HOOK_INSTALLED`.
+pub struct TerminalGuard {
+    _private: (), // prevents construction via `TerminalGuard` struct literal from outside this module
+}
 
 impl TerminalGuard {
     /// Enters raw mode and the alternate screen.
@@ -33,6 +44,14 @@ impl TerminalGuard {
     /// screen without arranging to leave it" is not a state the caller can
     /// express.
     pub fn enter() -> io::Result<Self> {
+        // First, before the terminal is touched. `install_panic_hook` records the
+        // calling thread as the terminal's owner, and this is the only call site,
+        // so the thread that enters the terminal and the thread the hook restores
+        // for are the same one by construction rather than by a doc comment asking
+        // the caller to get the order right. Installing ahead of `enable_raw_mode`
+        // also means a panic inside this function is reported on an intact screen.
+        install_panic_hook();
+
         enable_raw_mode()?;
 
         // Constructed before the next fallible step, not after: if entering the
@@ -40,7 +59,7 @@ impl TerminalGuard {
         // raw mode is switched back off. Returning `Ok(Self)` at the end instead
         // would leave a failure here with raw mode still on and no guard in
         // existence to undo it.
-        let guard = Self;
+        let guard = Self { _private: () };
         execute!(io::stdout(), EnterAlternateScreen)?;
         Ok(guard)
     }
@@ -81,8 +100,8 @@ fn restore() -> io::Result<()> {
 
 /// Restores the terminal *before* a panic message is printed.
 ///
-/// Must be called from the thread that owns the terminal, because it records
-/// that thread's id to recognise it later.
+/// Called only from [`TerminalGuard::enter`], which is what ties the hook to the
+/// right thread: the id captured here belongs to whoever entered the terminal.
 ///
 /// Without this the default hook writes into the alternate screen while raw mode
 /// is still on, so the message staircases down the screen and then vanishes with
@@ -92,7 +111,14 @@ fn restore() -> io::Result<()> {
 ///
 /// The default hook is kept and called rather than replaced, so `RUST_BACKTRACE`
 /// and the standard message format keep working.
-pub fn install_panic_hook() {
+fn install_panic_hook() {
+    if PANIC_HOOK_INSTALLED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
     let terminal_owner = std::thread::current().id();
     let default_hook = std::panic::take_hook();
 
