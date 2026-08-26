@@ -7,6 +7,14 @@ edition = "2024"
 # value, so a wrong number here fails CI rather than misleading contributors.
 rust-version = "1.88"
 
+description = "A fast, lightweight TUI for exploring Git history"
+license = "MIT"
+repository = "https://github.com/greenbugx/GitLoom"
+homepage = "https://github.com/greenbugx/GitLoom"
+readme = "README.md"
+keywords = ["git", "tui", "terminal", "git-history", "git-graph"]
+categories = ["command-line-utilities", "development-tools"]
+
 [dependencies]
 chrono = "0.4.45"
 crossterm = "0.29.0"
