@@ -498,7 +498,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitloom"
+name = "gitloom-tui"
 version = "0.1.0"
 dependencies = [
  "chrono",
