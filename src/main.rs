@@ -17,8 +17,8 @@ fn main() -> ExitCode {
     // Arguments are settled before the terminal is touched, so `--help` and a
     // bad flag both print to a normal terminal instead of into the alternate
     // screen, and neither reaches `Repository::discover`.
-    let path = match cli::parse(std::env::args()) {
-        Ok(Cli::Run(path)) => path,
+    let (path, all_branches) = match cli::parse(std::env::args()) {
+        Ok(Cli::Run { path, all_branches }) => (path, all_branches),
         Ok(Cli::Help) => {
             println!("{}", cli::HELP);
             return ExitCode::SUCCESS;
@@ -34,7 +34,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match run(path) {
+    match run(path, all_branches) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("gitloom: {err}");
@@ -43,7 +43,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(path: Option<std::path::PathBuf>) -> Result<(), Box<dyn Error>> {
+fn run(path: Option<std::path::PathBuf>, all_branches: bool) -> Result<(), Box<dyn Error>> {
     // Bound to a name rather than `_`: `let _ = ` drops a value immediately, so
     // that spelling would leave raw mode before the first frame was drawn.
     // Declared ahead of `terminal` so it is dropped after it. `enter` installs
@@ -51,7 +51,7 @@ fn run(path: Option<std::path::PathBuf>) -> Result<(), Box<dyn Error>> {
     let _guard = TerminalGuard::enter()?;
 
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut app_state = AppState::new(path);
+    let mut app_state = AppState::new(path, all_branches);
 
     // No teardown to write here. `_guard` covers the normal return, the `?`
     // above, and a panic; the error travels up to `main`, which prints it after
@@ -157,11 +157,12 @@ fn handle_key(app_state: &mut AppState, key: KeyEvent) {
     let view_mode = app_state.view_mode;
     match (view_mode, code) {
         (ViewMode::Graph, KeyCode::Char('q')) => app_state.quit = true,
-        // In the graph pane Esc backs out of a file's history. With full
-        // history already showing there is nothing to back out of, so it does
-        // what Esc has always done here and clears any lingering message.
+        // In the graph pane Esc backs out of a scoped view (a file's history,
+        // or all branches). With unscoped HEAD history already showing there
+        // is nothing to back out of, so it does what Esc has always done
+        // here and clears any lingering message.
         (ViewMode::Graph, KeyCode::Esc) => {
-            if !app_state.close_file_history() {
+            if !app_state.close_history() {
                 app_state.close_details();
             }
         }
@@ -192,6 +193,10 @@ fn handle_key(app_state: &mut AppState, key: KeyEvent) {
         (ViewMode::Files, KeyCode::Char('l') | KeyCode::Right) => app_state.open_file_history(),
         (_, KeyCode::Right | KeyCode::Char('l')) => app_state.scroll_details_right(),
         (_, KeyCode::Left | KeyCode::Char('h')) => app_state.scroll_details_left(),
+
+        // Scoped to the graph pane, same as `l` above: elsewhere `a` has no
+        // meaning, so it falls through to the catch-all and does nothing.
+        (ViewMode::Graph, KeyCode::Char('a')) => app_state.toggle_all_branches_history(),
 
         (ViewMode::Refs, KeyCode::Enter) => app_state.close_details(),
         (_, KeyCode::Enter) => app_state.load_details(),

@@ -10,8 +10,13 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cli {
-    /// Open the TUI, on the given path or the current directory.
-    Run(Option<PathBuf>),
+    /// Open the TUI. `path` defaults to the current directory; `all_branches`
+    /// mirrors `--all`, opening the graph already scoped to every local
+    /// branch instead of HEAD only.
+    Run {
+        path: Option<PathBuf>,
+        all_branches: bool,
+    },
     Help,
     Version,
 }
@@ -27,6 +32,7 @@ ARGS:
               directory inside a working tree will do.
 
 OPTIONS:
+    -a, --all        Open the graph scoped to every local branch, not just HEAD
     -h, --help       Print this help and exit
     -V, --version    Print the version and exit
 
@@ -47,11 +53,13 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut path: Option<PathBuf> = None;
+    let mut all_branches = false;
 
     for arg in args.into_iter().skip(1) {
         match arg.as_str() {
             "-h" | "--help" => return Ok(Cli::Help),
             "-V" | "--version" => return Ok(Cli::Version),
+            "-a" | "--all" => all_branches = true,
             other if other.starts_with('-') && other != "-" => {
                 return Err(format!("unknown option `{other}`"));
             }
@@ -64,7 +72,7 @@ where
         }
     }
 
-    Ok(Cli::Run(path))
+    Ok(Cli::Run { path, all_branches })
 }
 
 #[cfg(test)]
@@ -77,14 +85,23 @@ mod tests {
 
     #[test]
     fn no_arguments_opens_the_current_directory() {
-        assert_eq!(parse_args(&["gitloom"]), Ok(Cli::Run(None)));
+        assert_eq!(
+            parse_args(&["gitloom"]),
+            Ok(Cli::Run {
+                path: None,
+                all_branches: false
+            })
+        );
     }
 
     #[test]
     fn a_positional_path_is_the_repository_to_open() {
         assert_eq!(
             parse_args(&["gitloom", "/src/project"]),
-            Ok(Cli::Run(Some(PathBuf::from("/src/project"))))
+            Ok(Cli::Run {
+                path: Some(PathBuf::from("/src/project")),
+                all_branches: false
+            })
         );
     }
 
@@ -96,13 +113,50 @@ mod tests {
         assert_eq!(parse_args(&["gitloom", "-V"]), Ok(Cli::Version));
     }
 
+    #[test]
+    fn all_flag_is_recognised_in_both_forms() {
+        assert_eq!(
+            parse_args(&["gitloom", "--all"]),
+            Ok(Cli::Run {
+                path: None,
+                all_branches: true
+            })
+        );
+        assert_eq!(
+            parse_args(&["gitloom", "-a"]),
+            Ok(Cli::Run {
+                path: None,
+                all_branches: true
+            })
+        );
+    }
+
+    #[test]
+    fn all_flag_and_a_path_combine() {
+        assert_eq!(
+            parse_args(&["gitloom", "--all", "/src/project"]),
+            Ok(Cli::Run {
+                path: Some(PathBuf::from("/src/project")),
+                all_branches: true
+            })
+        );
+        assert_eq!(
+            parse_args(&["gitloom", "/src/project", "--all"]),
+            Ok(Cli::Run {
+                path: Some(PathBuf::from("/src/project")),
+                all_branches: true
+            }),
+            "flag order relative to the path should not matter"
+        );
+    }
+
     /// The bug this parser exists to fix: `--help` used to be taken as a path
     /// and handed to `Repository::discover`.
     #[test]
     fn a_flag_is_never_treated_as_a_path() {
         assert!(!matches!(
             parse_args(&["gitloom", "--help"]),
-            Ok(Cli::Run(_))
+            Ok(Cli::Run { .. })
         ));
         assert!(parse_args(&["gitloom", "--nope"]).is_err());
     }
@@ -121,7 +175,10 @@ mod tests {
     fn a_bare_dash_is_a_path_not_a_flag() {
         assert_eq!(
             parse_args(&["gitloom", "-"]),
-            Ok(Cli::Run(Some(PathBuf::from("-"))))
+            Ok(Cli::Run {
+                path: Some(PathBuf::from("-")),
+                all_branches: false
+            })
         );
     }
 }

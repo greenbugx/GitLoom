@@ -38,7 +38,8 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     // commits. Built as an owned string so the block borrows nothing from
     // `state`, leaving it free to be mutated just below.
     let graph_title = match &state.history {
-        HistoryScope::All => "GRAPH AREA".to_string(),
+        HistoryScope::Head => "GRAPH AREA".to_string(),
+        HistoryScope::AllBranches => "GRAPH AREA (ALL BRANCHES)".to_string(),
         HistoryScope::File(path) => format!("HISTORY OF {path}"),
     };
     let graph_block = Block::bordered().title(graph_title);
