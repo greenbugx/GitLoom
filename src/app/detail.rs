@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use crate::git::commit::{CommitDetails, CommitInfo};
-use crate::git::repository::GitRepository;
+use crate::git::repository::{GitRepository, WalkStart};
 
 /// Work for the detail thread. One variant per pane that reads from git.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,8 +32,13 @@ pub enum Request {
     Details(String),
     Files(String),
     Diff(String),
-    FileHistory { path: String, max_count: usize },
+    FileHistory {
+        path: String,
+        start: WalkStart,
+        max_count: usize,
+    },
     AllBranchesHistory(usize),
+    HeadHistory(usize),
 }
 
 impl Request {
@@ -44,6 +49,7 @@ impl Request {
             Request::Diff(_) => "Loading diff...",
             Request::FileHistory { .. } => "Loading file history...",
             Request::AllBranchesHistory(_) => "Loading all branches...",
+            Request::HeadHistory(_) => "Loading HEAD history...",
         }
     }
 }
@@ -56,9 +62,11 @@ pub enum Payload {
     Diff(Vec<String>),
     FileHistory {
         path: String,
+        start: WalkStart,
         commits: Vec<CommitInfo>,
     },
     AllBranchesHistory(Vec<CommitInfo>),
+    HeadHistory(Vec<CommitInfo>),
 }
 
 /// A reply from the worker, tagged with the sequence number of the request that
@@ -202,10 +210,15 @@ fn run(repo: &GitRepository, request: &Request) -> Result<Payload, String> {
             .commit_diff(oid)
             .map(Payload::Diff)
             .map_err(|e| format!("Failed to load diff: {}", e.message())),
-        Request::FileHistory { path, max_count } => repo
-            .file_history(path, *max_count)
+        Request::FileHistory {
+            path,
+            start,
+            max_count,
+        } => repo
+            .file_history(path, *start, *max_count)
             .map(|commits| Payload::FileHistory {
                 path: path.clone(),
+                start: *start,
                 commits,
             })
             .map_err(|e| format!("Failed to load history for {path}: {}", e.message())),
@@ -213,6 +226,10 @@ fn run(repo: &GitRepository, request: &Request) -> Result<Payload, String> {
             .commits_all_branches_with_progress(*max_count, |_| true)
             .map(Payload::AllBranchesHistory)
             .map_err(|e| format!("Failed to load all-branches history: {}", e.message())),
+        Request::HeadHistory(max_count) => repo
+            .commits_with_progress(*max_count, |_| true)
+            .map(Payload::HeadHistory)
+            .map_err(|e| format!("Failed to load HEAD history: {}", e.message())),
     }
 }
 

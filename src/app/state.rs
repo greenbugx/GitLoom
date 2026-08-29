@@ -1,7 +1,7 @@
 use crate::app::detail::{DetailWorker, Payload, Request};
 use crate::app::loading::{self, LoadMessage, LoadingState};
 use crate::git::commit::CommitInfo;
-use crate::git::repository::{Branch, GitRepository, Ref, RefName, RepoInfo, RepoRefs};
+use crate::git::repository::{Branch, GitRepository, Ref, RefName, RepoInfo, RepoRefs, WalkStart};
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use std::collections::HashMap;
@@ -19,8 +19,24 @@ pub enum HistoryScope {
     /// Everything reachable from HEAD or any local branch tip: the `--all`
     /// startup flag, or [`AppState::toggle_all_branches_history`].
     AllBranches,
-    /// Only the commits that touched this path.
-    File(String),
+    /// Only the commits that touched this path, filtered from the walk
+    /// `start` names. A file's history is a subset of the graph it was
+    /// opened from, so the graph it came from is part of the scope: from
+    /// the all-branches view it walks the branch tips too, or a path that
+    /// only exists on an unmerged branch reports "no commits" even though
+    /// the selected commit just changed it.
+    File { path: String, start: WalkStart },
+}
+
+impl HistoryScope {
+    /// The revwalk starting points that produce this scope's commits.
+    fn walk_start(&self) -> WalkStart {
+        match self {
+            HistoryScope::Head => WalkStart::Head,
+            HistoryScope::AllBranches => WalkStart::HeadAndLocalBranches,
+            HistoryScope::File { start, .. } => *start,
+        }
+    }
 }
 
 /// A one-line message for the bottom bar.
@@ -580,8 +596,13 @@ impl AppState {
                 self.changed_files = files;
             }
             Payload::Diff(lines) => self.diff_lines = lines,
-            Payload::FileHistory { path, commits } => self.enter_file_history(path, commits),
+            Payload::FileHistory {
+                path,
+                start,
+                commits,
+            } => self.enter_file_history(path, start, commits),
             Payload::AllBranchesHistory(commits) => self.enter_all_branches_history(commits),
+            Payload::HeadHistory(commits) => self.enter_head_history(commits),
         }
     }
 
@@ -700,6 +721,12 @@ impl AppState {
     /// Scope the graph pane to the history of the file selected in the CHANGED
     /// FILES pane. Bound to `l` there, where there is no horizontal scrolling
     /// to conflict with.
+    ///
+    /// The walk starts from the graph currently on screen (see
+    /// [`HistoryScope::walk_start`]), not unconditionally from HEAD: from the
+    /// all-branches view, a path that only exists on an unmerged branch would
+    /// otherwise report "no commits" even though the selected commit just
+    /// changed it.
     pub fn open_file_history(&mut self) {
         let Some(path) = self
             .files_list_state
@@ -712,28 +739,57 @@ impl AppState {
         };
         self.request(Request::FileHistory {
             path,
+            start: self.history.walk_start(),
             max_count: loading::COMMIT_LIMIT,
         });
     }
 
     /// Toggle the graph pane between HEAD-only and every local branch. Bound
-    /// to `a` in the graph pane. A second press (or `Esc`) closes it the same
-    /// way closing a file's history does, since both are the one scoped view
-    /// the graph pane can show at a time.
+    /// to `a` in the graph pane, which never dead-ends: from either base
+    /// (HEAD by default, all branches under `--all`) the first press walks
+    /// the other view and parks the base, and from a scoped view the press
+    /// closes back to whatever is parked underneath.
+    ///
+    /// The parked-underneath case is what keeps repeated presses cheap: the
+    /// default session's second `a` restores the parked HEAD view without
+    /// re-walking it, and an `--all` session's second `a` restores the parked
+    /// all-branches view the same way.
     ///
     /// See [`crate::git::repository::GitRepository::commits_all_branches_with_progress`]
     /// for why this is local branches only, not `git log --all`'s full set.
     pub fn toggle_all_branches_history(&mut self) {
-        if self.history == HistoryScope::AllBranches {
-            self.close_history();
+        // `a` always toggles to the other of the two graph views; a file
+        // scope counts as whichever view it was opened from, so `a` switches
+        // to all branches from there.
+        let (target, request) = if self.history == HistoryScope::AllBranches {
+            (
+                HistoryScope::Head,
+                Request::HeadHistory(loading::COMMIT_LIMIT),
+            )
+        } else {
+            (
+                HistoryScope::AllBranches,
+                Request::AllBranchesHistory(loading::COMMIT_LIMIT),
+            )
+        };
+        // The target may be the view already parked underneath this one
+        // (HEAD under all-branches, or the reverse under `--all`): closing
+        // restores it as it was, selection and minimap included, with no
+        // walk at all.
+        if self
+            .saved_history
+            .as_ref()
+            .is_some_and(|saved| saved.scope == target)
+            && self.close_history()
+        {
             return;
         }
-        self.request(Request::AllBranchesHistory(loading::COMMIT_LIMIT));
+        self.request(request);
     }
 
-    /// Swap the graph pane over to a single file's history, parking full
-    /// history so `close_history` can put it back.
-    fn enter_file_history(&mut self, path: String, commits: Vec<CommitInfo>) {
+    /// Swap the graph pane over to a single file's history, parking whatever
+    /// graph it was opened from so `close_history` can put it back.
+    fn enter_file_history(&mut self, path: String, start: WalkStart, commits: Vec<CommitInfo>) {
         if commits.is_empty() {
             self.error(format!("No commits in this history touched {path}"));
             return;
@@ -741,7 +797,7 @@ impl AppState {
         // Linear rows, not `GraphEngine::build`: see `build_linear` for why a
         // filtered list cannot be laid out as a graph.
         let graph_rows = GraphEngine::build_linear(&commits);
-        self.enter_scoped_history(HistoryScope::File(path), commits, graph_rows);
+        self.enter_scoped_history(HistoryScope::File { path, start }, commits, graph_rows);
     }
 
     /// Swap the graph pane over to the all-branches history, parking
@@ -759,10 +815,22 @@ impl AppState {
         self.enter_scoped_history(HistoryScope::AllBranches, commits, graph_rows);
     }
 
-    /// Shared by [`AppState::enter_file_history`] and
-    /// [`AppState::enter_all_branches_history`]: park the view underneath the
-    /// first scope opened, then swap the graph pane's commit list and layout
-    /// over to `commits`/`graph_rows`.
+    /// Swap the graph pane over to the HEAD-only history: the `a` toggle's
+    /// other direction, reachable when the all-branches view is the base
+    /// (an `--all` session). Parks the all-branches view underneath, so the
+    /// next `a` (or `Esc`) restores it rather than re-walking it.
+    fn enter_head_history(&mut self, commits: Vec<CommitInfo>) {
+        if commits.is_empty() {
+            self.error("No commits reachable from HEAD");
+            return;
+        }
+        let graph_rows = GraphEngine::build(&commits);
+        self.enter_scoped_history(HistoryScope::Head, commits, graph_rows);
+    }
+
+    /// Shared by the three `enter_*_history` methods: park the view
+    /// underneath the first scope opened, then swap the graph pane's commit
+    /// list and layout over to `commits`/`graph_rows`.
     fn enter_scoped_history(
         &mut self,
         scope: HistoryScope,

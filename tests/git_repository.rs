@@ -9,7 +9,7 @@ mod common;
 use common::TestRepo;
 use gitloom::app::AppState;
 use gitloom::app::ref_pane_rows;
-use gitloom::git::repository::{Branch, GitRepository, Ref, RefName};
+use gitloom::git::repository::{Branch, GitRepository, Ref, RefName, WalkStart};
 use gitloom::graph::layout::GraphEngine;
 use std::collections::HashSet;
 
@@ -442,7 +442,7 @@ fn file_history_returns_only_the_commits_that_changed_the_path() {
     let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
 
     let history = repo
-        .file_history("README.md", 100)
+        .file_history("README.md", WalkStart::Head, 100)
         .expect("walk the history of README.md");
 
     let oids: Vec<&str> = history.iter().map(|c| c.oid.as_str()).collect();
@@ -465,7 +465,7 @@ fn file_history_covers_adds_edits_and_first_parent_merges() {
     let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
 
     let history = repo
-        .file_history("src/lib.rs", 100)
+        .file_history("src/lib.rs", WalkStart::Head, 100)
         .expect("walk the history of src/lib.rs");
 
     let oids: Vec<&str> = history.iter().map(|c| c.oid.as_str()).collect();
@@ -488,7 +488,7 @@ fn file_history_includes_a_side_branch_file_and_its_merge() {
     let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
 
     let history = repo
-        .file_history("src/feature.rs", 100)
+        .file_history("src/feature.rs", WalkStart::Head, 100)
         .expect("walk the history of src/feature.rs");
 
     let oids: Vec<&str> = history.iter().map(|c| c.oid.as_str()).collect();
@@ -503,7 +503,7 @@ fn file_history_stops_after_max_count_matches() {
     let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
 
     let history = repo
-        .file_history("src/lib.rs", 2)
+        .file_history("src/lib.rs", WalkStart::Head, 2)
         .expect("walk the history of src/lib.rs");
 
     let oids: Vec<&str> = history.iter().map(|c| c.oid.as_str()).collect();
@@ -521,7 +521,7 @@ fn file_history_of_an_unknown_path_is_empty() {
     let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
 
     let history = repo
-        .file_history("does/not/exist.txt", 100)
+        .file_history("does/not/exist.txt", WalkStart::Head, 100)
         .expect("an unknown path is not an error");
     assert!(history.is_empty());
 }
@@ -537,7 +537,7 @@ fn file_history_includes_a_mode_only_change() {
     let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
 
     let history = repo
-        .file_history("script.sh", 100)
+        .file_history("script.sh", WalkStart::Head, 100)
         .expect("walk the history of script.sh");
 
     let oids: Vec<&str> = history.iter().map(|c| c.oid.as_str()).collect();
@@ -590,7 +590,7 @@ fn file_history_lays_out_as_one_row_per_commit() {
     let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
 
     let history = repo
-        .file_history("src/lib.rs", 100)
+        .file_history("src/lib.rs", WalkStart::Head, 100)
         .expect("walk the history of src/lib.rs");
     let rows = GraphEngine::build_linear(&history);
 
@@ -812,8 +812,12 @@ fn an_all_branches_start_returns_to_all_branches_after_a_file_scope() {
     state.files_list_state.select(Some(0));
     state.open_file_history();
 
+    let wanted = gitloom::app::HistoryScope::File {
+        path: "src/lib.rs".to_string(),
+        start: WalkStart::HeadAndLocalBranches,
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while state.history != gitloom::app::HistoryScope::File("src/lib.rs".to_string()) {
+    while state.history != wanted {
         state.poll_detail();
         assert!(
             std::time::Instant::now() < deadline,
@@ -834,5 +838,132 @@ fn an_all_branches_start_returns_to_all_branches_after_a_file_scope() {
     assert!(
         state.commits.iter().any(|c| c.oid == fixture.stray_tip),
         "the restored view is the all-branches history, not HEAD-only"
+    );
+}
+
+/// The walk start is not decoration for `file_history`: a path that only
+/// exists on an unmerged branch is invisible to a HEAD-rooted walk and
+/// found by one rooted at the local branch tips.
+#[test]
+fn file_history_honors_the_walk_start() {
+    let (_repo_dir, fixture) = TestRepo::build_unmerged_branch_fixture();
+    let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
+
+    let head_only = repo
+        .file_history("stray.rs", WalkStart::Head, 100)
+        .expect("walk stray.rs history from HEAD");
+    assert!(
+        head_only.is_empty(),
+        "the bug: a HEAD-rooted walk cannot see a file only an unmerged \
+         branch ever touched"
+    );
+
+    let all_branches = repo
+        .file_history("stray.rs", WalkStart::HeadAndLocalBranches, 100)
+        .expect("walk stray.rs history from the branch tips");
+    assert_eq!(
+        all_branches
+            .iter()
+            .map(|c| c.oid.as_str())
+            .collect::<Vec<_>>(),
+        vec![fixture.stray_tip.as_str()],
+        "the fix: the commit that introduced stray.rs is exactly the stray tip"
+    );
+}
+
+/// From the all-branches graph, pressing `l` on a path
+/// that only an unmerged branch touched must open a real history for it.
+#[test]
+fn file_history_from_the_all_branches_graph_walks_branch_tips() {
+    let (_repo_dir, fixture) = TestRepo::build_unmerged_branch_fixture();
+    let mut state = AppState::new(Some(fixture.repo_path.clone()), true);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.commits.is_empty() {
+        state.poll_load();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup load never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    state.changed_files = vec!["stray.rs".to_string()];
+    state.files_list_state.select(Some(0));
+    state.open_file_history();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !matches!(
+        state.history,
+        gitloom::app::HistoryScope::File { ref path, .. } if path == "stray.rs"
+    ) {
+        state.poll_detail();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "file-history request never resolved"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert!(
+        state.commits.iter().any(|c| c.oid == fixture.stray_tip),
+        "the file history should contain the commit that touched stray.rs"
+    );
+    assert!(
+        !state
+            .status
+            .as_ref()
+            .is_some_and(|s| s.is_error() && s.text().contains("No commits")),
+        "no dead-end error may be surfaced for a path the all-branches \
+         graph just showed a commit for"
+    );
+}
+
+/// Under `--all` the first `a` used to be swallowed (nothing was
+/// parked, `close_history` returned false, the method returned). It must
+/// fetch the HEAD-only history instead, and the press after that must put
+/// the all-branches view back.
+#[test]
+fn an_all_session_first_a_press_fetches_head_history() {
+    let (_repo_dir, fixture) = TestRepo::build_unmerged_branch_fixture();
+    let mut state = AppState::new(Some(fixture.repo_path.clone()), true);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.commits.is_empty() {
+        state.poll_load();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup load never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // First press: leaves the all-branches base for the HEAD-only view.
+    state.toggle_all_branches_history();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.history != gitloom::app::HistoryScope::Head {
+        state.poll_detail();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the HEAD-history request never resolved: `a` was swallowed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        !state.commits.iter().any(|c| c.oid == fixture.stray_tip),
+        "the HEAD-only view must not contain the unmerged branch's commit"
+    );
+
+    // Second press: restores the parked all-branches view synchronously,
+    // without another request to wait for.
+    state.toggle_all_branches_history();
+    assert_eq!(
+        state.history,
+        gitloom::app::HistoryScope::AllBranches,
+        "the second press restores the all-branches base"
+    );
+    assert!(
+        state.commits.iter().any(|c| c.oid == fixture.stray_tip),
+        "the restored view is the all-branches history the app opened with"
     );
 }
