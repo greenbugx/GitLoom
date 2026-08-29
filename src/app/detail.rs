@@ -33,6 +33,7 @@ pub enum Request {
     Files(String),
     Diff(String),
     FileHistory { path: String, max_count: usize },
+    AllBranchesHistory(usize),
 }
 
 impl Request {
@@ -42,6 +43,7 @@ impl Request {
             Request::Files(_) => "Loading changed files...",
             Request::Diff(_) => "Loading diff...",
             Request::FileHistory { .. } => "Loading file history...",
+            Request::AllBranchesHistory(_) => "Loading all branches...",
         }
     }
 }
@@ -56,6 +58,7 @@ pub enum Payload {
         path: String,
         commits: Vec<CommitInfo>,
     },
+    AllBranchesHistory(Vec<CommitInfo>),
 }
 
 /// A reply from the worker, tagged with the sequence number of the request that
@@ -206,6 +209,10 @@ fn run(repo: &GitRepository, request: &Request) -> Result<Payload, String> {
                 commits,
             })
             .map_err(|e| format!("Failed to load history for {path}: {}", e.message())),
+        Request::AllBranchesHistory(max_count) => repo
+            .commits_all_branches_with_progress(*max_count, |_| true)
+            .map(Payload::AllBranchesHistory)
+            .map_err(|e| format!("Failed to load all-branches history: {}", e.message())),
     }
 }
 
@@ -232,6 +239,22 @@ mod tests {
         let (_tx, rx) = mpsc::channel::<(u64, Request)>();
         let first = (7, Request::Files("abc".to_string()));
         assert_eq!(coalesce(first.clone(), &rx), first);
+    }
+
+    #[test]
+    fn a_broken_repository_reports_instead_of_hanging_for_all_branches() {
+        let mut worker = DetailWorker::spawn(PathBuf::from("/definitely/not/a/repo"));
+        assert!(worker.request(Request::AllBranchesHistory(100)));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(result) = worker.poll() {
+                assert!(result.is_err(), "a missing repo cannot produce a history");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "worker never replied");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// A worker whose repository path is bogus should answer with an error

@@ -62,6 +62,19 @@ pub struct ModeFixture {
     pub chmod: String,
 }
 
+/// Oids of the unmerged-branch fixture, built by
+/// [`TestRepo::build_unmerged_branch_fixture`].
+pub struct UnmergedFixture {
+    pub repo_path: std::path::PathBuf,
+    /// Root commit on `main`; also where `stray` branches off.
+    pub root: String,
+    /// Tip of `main`. `HEAD` stays checked out here, never on `stray`, so a
+    /// HEAD-only walk cannot see `stray_tip` by accident.
+    pub main_tip: String,
+    /// Tip of `stray`, a branch never merged into `main`.
+    pub stray_tip: String,
+}
+
 impl TestRepo {
     pub fn init() -> Self {
         let dir = tempfile::tempdir().expect("create temp dir for test repo");
@@ -132,6 +145,66 @@ impl TestRepo {
             .repo
             .commit(Some("HEAD"), &sig, &sig, summary, &tree, &parent_refs)
             .expect("create commit");
+        oid.to_string()
+    }
+
+    /// Commits `contents` at `relative_path` onto `refname` (e.g.
+    /// `"refs/heads/stray"`) directly, without checking that branch out or
+    /// touching `HEAD` or the working tree at all.
+    ///
+    /// `relative_path` must be a top-level name, for the same reason as
+    /// `commit_mode`: `TreeBuilder` edits one tree, and no fixture needs a
+    /// nested path here yet.
+    ///
+    /// Unlike `commit_file`, the new tree is built from `refname`'s current
+    /// tip rather than through `self.repo.index()`: the index reflects
+    /// whatever is checked out, so writing through it here would silently
+    /// commit onto the wrong branch (or corrupt the real working tree, since
+    /// nothing was actually checked out to `refname`). `Repository::blob`
+    /// writes the content straight into the object database, and
+    /// `TreeBuilder` adds it to a tree built from `refname`'s tip, exactly
+    /// mirroring how `commit_mode` edits a tree without touching disk.
+    fn commit_on_ref(
+        &mut self,
+        refname: &str,
+        relative_path: &str,
+        contents: &str,
+        summary: &str,
+    ) -> String {
+        assert!(
+            !relative_path.contains('/'),
+            "commit_on_ref only handles top-level paths, got `{relative_path}`"
+        );
+        let ts = self.next_timestamp();
+
+        let reference = self
+            .repo
+            .find_reference(refname)
+            .unwrap_or_else(|e| panic!("find_reference({refname}) failed: {e}"));
+        let parent_commit = reference
+            .peel_to_commit()
+            .expect("target ref peels to a commit");
+        let parent_tree = parent_commit.tree().expect("target ref's tip has a tree");
+
+        let blob_oid = self
+            .repo
+            .blob(contents.as_bytes())
+            .expect("write blob content");
+        let mut builder = self
+            .repo
+            .treebuilder(Some(&parent_tree))
+            .expect("open a treebuilder on the target ref's tree");
+        builder
+            .insert(relative_path, blob_oid, REGULAR)
+            .expect("insert the new file into the tree");
+        let tree_oid = builder.write().expect("write the rebuilt tree");
+        let tree = self.repo.find_tree(tree_oid).expect("find rebuilt tree");
+
+        let sig = Self::signature_at(ts);
+        let oid = self
+            .repo
+            .commit(Some(refname), &sig, &sig, summary, &tree, &[&parent_commit])
+            .expect("create commit on target ref");
         oid.to_string()
     }
 
@@ -328,6 +401,40 @@ impl TestRepo {
             added,
             unrelated,
             chmod,
+        };
+        (repo, fixture)
+    }
+
+    /// A history with a branch that is never merged back and never checked
+    /// out again after being created: `HEAD` stays on `main` the whole time.
+    pub fn build_unmerged_branch_fixture() -> (Self, UnmergedFixture) {
+        let mut repo = Self::init();
+
+        let root = repo.commit_file("README.md", "# Test Repo\n", "chore: init repository");
+        repo.create_branch_at("stray", &root);
+
+        let main_tip = repo.commit_file(
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+            "feat: add add() helper on main",
+        );
+
+        // A commit made directly on `stray` without ever checking it out:
+        // `commit_file` commits on whatever `HEAD` currently resolves to, and
+        // a non-HEAD branch ref can still be advanced by passing its full
+        // ref name instead of `"HEAD"`.
+        let stray_tip = repo.commit_on_ref(
+            "refs/heads/stray",
+            "stray.rs",
+            "pub fn only_on_stray() {}\n",
+            "feat: work in progress on a branch nobody merged",
+        );
+
+        let fixture = UnmergedFixture {
+            repo_path: repo.path().to_path_buf(),
+            root,
+            main_tip,
+            stray_tip,
         };
         (repo, fixture)
     }

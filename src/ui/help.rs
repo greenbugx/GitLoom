@@ -47,7 +47,8 @@ pub const SECTIONS: &[Section] = &[
             ("d", "Diff"),
             ("b", "Branches & tags"),
             ("l", "In the files pane: history of the selected file"),
-            ("Esc", "Close the pane, or leave a file's history"),
+            ("a", "Toggle the graph between HEAD and all branches"),
+            ("Esc", "Close the pane, or leave a scoped history view"),
         ],
     },
     Section {
@@ -166,7 +167,7 @@ mod tests {
 
         for key in [
             "j", "k", "J", "K", "g", "G", "PgUp", "PgDn", "Home", "End", "h", "l", "Enter", "f",
-            "d", "b", "Esc", "/", "n", "N", "y", "?", "q",
+            "d", "b", "a", "Esc", "/", "n", "N", "y", "?", "q",
         ] {
             assert!(documented.contains(key), "`{key}` is not documented");
         }

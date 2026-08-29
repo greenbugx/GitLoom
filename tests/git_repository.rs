@@ -229,7 +229,7 @@ fn search_finds_commits_by_summary_author_and_oid() {
     // usually the GitLoom checkout itself, not what this test wants) so the
     // background loader and repo_state reflect the fixture, not the
     // repository this test suite happens to live in.
-    let mut state = AppState::new(Some(fixture.repo_path.clone()));
+    let mut state = AppState::new(Some(fixture.repo_path.clone()), false);
     let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
     state.commits = repo.commits(100).expect("walk commit history");
 
@@ -599,4 +599,240 @@ fn file_history_lays_out_as_one_row_per_commit() {
         assert_eq!(row.commit_oid, commit.oid);
         assert_eq!(row.node_lane, 0);
     }
+}
+
+/// A HEAD-only walk cannot see a commit that only exists on a branch nobody
+/// has merged or checked out. `commits` (HEAD-only) should miss `stray_tip`;
+#[test]
+fn head_only_walk_misses_an_unmerged_branchs_commits() {
+    let (_repo_dir, fixture) = TestRepo::build_unmerged_branch_fixture();
+    let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
+
+    let head_only = repo.commits(100).expect("walk HEAD-only history");
+    let head_only_oids: HashSet<&str> = head_only.iter().map(|c| c.oid.as_str()).collect();
+
+    assert!(
+        head_only_oids.contains(fixture.root.as_str()),
+        "root is an ancestor of HEAD (main) and should still be there"
+    );
+    assert!(
+        head_only_oids.contains(fixture.main_tip.as_str()),
+        "HEAD's own tip should be there"
+    );
+    assert!(
+        !head_only_oids.contains(fixture.stray_tip.as_str()),
+        "this is the bug: a HEAD-only walk should NOT reach a commit that \
+         only exists on an unmerged branch"
+    );
+}
+
+/// The fix: `commits_all_branches_with_progress` should surface exactly the
+/// commit the HEAD-only walk above misses, in addition to everything HEAD
+/// already reaches, deduplicated (the shared `root` commit appears once).
+#[test]
+fn all_branches_walk_finds_an_unmerged_branchs_commits() {
+    let (_repo_dir, fixture) = TestRepo::build_unmerged_branch_fixture();
+    let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
+
+    let all = repo
+        .commits_all_branches_with_progress(100, |_| true)
+        .expect("walk all-branches history");
+    let all_oids: Vec<&str> = all.iter().map(|c| c.oid.as_str()).collect();
+    let all_oids_set: HashSet<&str> = all_oids.iter().copied().collect();
+
+    assert!(
+        all_oids_set.contains(fixture.stray_tip.as_str()),
+        "the fix: an all-branches walk should reach `stray`'s tip"
+    );
+    assert!(all_oids_set.contains(fixture.root.as_str()));
+    assert!(all_oids_set.contains(fixture.main_tip.as_str()));
+
+    assert_eq!(
+        all_oids.len(),
+        all_oids_set.len(),
+        "root is reachable from both main and stray; it must be yielded once, \
+         not once per branch that reaches it"
+    );
+    assert_eq!(
+        all_oids_set.len(),
+        3,
+        "exactly root, main_tip and stray_tip should exist in this fixture"
+    );
+}
+
+/// The all-branches walk is a superset of the HEAD-only one: everything
+/// the default view already shows is still there once branches are added,
+/// nothing HEAD reaches gets dropped by widening the walk.
+#[test]
+fn all_branches_walk_is_a_superset_of_the_head_only_walk() {
+    let (_repo_dir, fixture) = TestRepo::build_unmerged_branch_fixture();
+    let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
+
+    let head_only: HashSet<String> = repo
+        .commits(100)
+        .expect("walk HEAD-only history")
+        .into_iter()
+        .map(|c| c.oid)
+        .collect();
+    let all_branches: HashSet<String> = repo
+        .commits_all_branches_with_progress(100, |_| true)
+        .expect("walk all-branches history")
+        .into_iter()
+        .map(|c| c.oid)
+        .collect();
+
+    assert!(
+        head_only.is_subset(&all_branches),
+        "every commit HEAD-only shows must still show once branches are included"
+    );
+}
+
+/// `AppState::toggle_all_branches_history` should widen the graph pane's
+/// commit list on the first press, and `close_history` should put the
+/// original HEAD-only list back exactly, selection included.
+#[test]
+fn toggling_all_branches_widens_then_restores_head_only_history() {
+    let (_repo_dir, fixture) = TestRepo::build_unmerged_branch_fixture();
+    let repo = GitRepository::open(&fixture.repo_path).expect("open fixture repo");
+
+    let mut state = AppState::new(Some(fixture.repo_path.clone()), false);
+
+    // Wait for the app's own background load (spawned by `AppState::new`) to
+    // land, so `state.commits` reflects the real HEAD-only startup load
+    // rather than an empty list still in flight.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.commits.is_empty() {
+        state.poll_load();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup load never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let head_only_len = state.commits.len();
+    assert!(
+        !state.commits.iter().any(|c| c.oid == fixture.stray_tip),
+        "sanity check on the fixture: the HEAD-only startup load must not \
+         already include the unmerged branch's commit"
+    );
+
+    state.toggle_all_branches_history();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !state.commits.iter().any(|c| c.oid == fixture.stray_tip) {
+        state.poll_detail();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "all-branches request never resolved"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        state.history,
+        gitloom::app::HistoryScope::AllBranches,
+        "the graph pane should report itself as scoped to all branches"
+    );
+    let all_branches = repo
+        .commits_all_branches_with_progress(100, |_| true)
+        .expect("walk all-branches history for comparison");
+    assert_eq!(
+        state.commits.len(),
+        all_branches.len(),
+        "the widened list should match a direct all-branches walk"
+    );
+
+    let closed = state.close_history();
+    assert!(closed, "close_history should report that it closed a scope");
+    assert_eq!(
+        state.commits.len(),
+        head_only_len,
+        "closing should put back exactly the original HEAD-only list"
+    );
+    assert!(
+        !state.commits.iter().any(|c| c.oid == fixture.stray_tip),
+        "the unmerged branch's commit should be gone again after closing"
+    );
+    assert_eq!(state.history, gitloom::app::HistoryScope::Head);
+}
+
+/// `--all` must widen the *startup* load itself: when the first load lands
+/// the graph is already scoped to all branches and already contains the
+/// unmerged branch's commit, with no second walk swapping content in after
+/// the fact.
+#[test]
+fn the_all_flag_scopes_the_startup_load() {
+    let (_repo_dir, fixture) = TestRepo::build_unmerged_branch_fixture();
+    let mut state = AppState::new(Some(fixture.repo_path.clone()), true);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.commits.is_empty() {
+        state.poll_load();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup load never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        state.history,
+        gitloom::app::HistoryScope::AllBranches,
+        "the graph should open scoped to all branches"
+    );
+    assert!(
+        state.commits.iter().any(|c| c.oid == fixture.stray_tip),
+        "the very first load must already include the unmerged branch's commit"
+    );
+}
+
+/// Under `--all` the view parked when a scope opens is the all-branches
+/// history, not HEAD: opening a file's history and closing it again must
+/// land back on all branches, with `history` matching what is on screen.
+#[test]
+fn an_all_branches_start_returns_to_all_branches_after_a_file_scope() {
+    let (_repo_dir, fixture) = TestRepo::build_unmerged_branch_fixture();
+    let mut state = AppState::new(Some(fixture.repo_path.clone()), true);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.commits.is_empty() {
+        state.poll_load();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup load never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Enter a file scope the way the files pane would: stage a selected path
+    // (`changed_files` and its list state are plain fields) and ask for its
+    // history, then wait for the scope to land.
+    state.changed_files = vec!["src/lib.rs".to_string()];
+    state.files_list_state.select(Some(0));
+    state.open_file_history();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.history != gitloom::app::HistoryScope::File("src/lib.rs".to_string()) {
+        state.poll_detail();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "file-history request never resolved"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert!(
+        state.close_history(),
+        "closing the file scope should restore the parked view"
+    );
+    assert_eq!(
+        state.history,
+        gitloom::app::HistoryScope::AllBranches,
+        "the restored scope is what was parked, not unconditionally HEAD"
+    );
+    assert!(
+        state.commits.iter().any(|c| c.oid == fixture.stray_tip),
+        "the restored view is the all-branches history, not HEAD-only"
+    );
 }

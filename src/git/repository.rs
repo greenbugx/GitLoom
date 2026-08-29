@@ -84,16 +84,66 @@ impl GitRepository {
         self.commits_with_progress(max_count, |_| true)
     }
 
+    /// Commits reachable from `HEAD` only. This is the default view: fast, and
+    /// what most work happens on, so it is what loads before anything else.
     pub fn commits_with_progress<F>(
         &self,
         max_count: usize,
-        mut on_progress: F,
+        on_progress: F,
     ) -> Result<Vec<crate::git::commit::CommitInfo>, git2::Error>
     where
         F: FnMut(usize) -> bool,
     {
         let mut revwalk = self.repo.revwalk()?;
         revwalk.push_head()?;
+        self.drain_revwalk(revwalk, max_count, on_progress)
+    }
+
+    /// Commits reachable from `HEAD` *or* any local branch tip: the union
+    /// `git log --all` (restricted to local branches; see below) would show,
+    /// deduplicated so a commit on several branches is yielded once.
+    ///
+    /// Remote-tracking branches are deliberately left out. Fetching without
+    /// having yet checked out or merged an update is a common state to be in,
+    /// and that would make the graph balloon with commits from a remote's
+    /// branches the user has no local counterpart for. A local branch is
+    /// always something the user made or explicitly checked out, so that is
+    /// the read of "all branches" this takes.
+    pub fn commits_all_branches_with_progress<F>(
+        &self,
+        max_count: usize,
+        on_progress: F,
+    ) -> Result<Vec<crate::git::commit::CommitInfo>, git2::Error>
+    where
+        F: FnMut(usize) -> bool,
+    {
+        let mut revwalk = self.repo.revwalk()?;
+        // Also pushes HEAD: on a detached HEAD (mid-rebase, or checked out to
+        // a bare commit) HEAD names a commit no branch necessarily points at,
+        // and dropping it would make "all branches" silently show less than
+        // the default view already did.
+        revwalk.push_head()?;
+        // libgit2 dedupes a revwalk by oid across every pushed starting
+        // point, so a commit reachable from two branch tips still comes out
+        // once; nothing here needs to deduplicate by hand.
+        revwalk.push_glob("refs/heads/*")?;
+        self.drain_revwalk(revwalk, max_count, on_progress)
+    }
+
+    /// Shared by both walks above: apply the sort, take up to `max_count`
+    /// commits, and report progress every [`PROGRESS_INTERVAL`] commits. The
+    /// two callers differ only in what they push onto `revwalk` before
+    /// calling this, so the walking, snapshotting and progress reporting
+    /// cannot drift between "HEAD only" and "all branches".
+    fn drain_revwalk<F>(
+        &self,
+        mut revwalk: git2::Revwalk<'_>,
+        max_count: usize,
+        mut on_progress: F,
+    ) -> Result<Vec<crate::git::commit::CommitInfo>, git2::Error>
+    where
+        F: FnMut(usize) -> bool,
+    {
         revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
 
         let mut commits = Vec::new();

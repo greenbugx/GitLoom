@@ -91,15 +91,26 @@ impl LoadingState {
     }
 }
 
-pub fn spawn(path: PathBuf) -> Receiver<LoadMessage> {
+/// Start the one-shot background load behind the progress screen.
+///
+/// `all_branches` mirrors the `--all` CLI flag: the history stage then walks
+/// every local branch tip, not just HEAD, so the graph's first frame is
+/// already the all-branches view. Widening this walk is what makes the flag
+/// cheap — one walk instead of a HEAD walk that a later swap would discard,
+/// and the loading screen's progress covers all of it.
+pub fn spawn(path: PathBuf, all_branches: bool) -> Receiver<LoadMessage> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = load(path, &tx);
+        let _ = load(path, all_branches, &tx);
     });
     rx
 }
 
-fn load(path: PathBuf, tx: &Sender<LoadMessage>) -> Result<(), SendError<LoadMessage>> {
+fn load(
+    path: PathBuf,
+    all_branches: bool,
+    tx: &Sender<LoadMessage>,
+) -> Result<(), SendError<LoadMessage>> {
     tx.send(LoadMessage::Stage(LoadStage::Opening))?;
 
     let repo = match GitRepository::open(&path) {
@@ -111,11 +122,13 @@ fn load(path: PathBuf, tx: &Sender<LoadMessage>) -> Result<(), SendError<LoadMes
     let git_dir = repo.path();
 
     tx.send(LoadMessage::Stage(LoadStage::History))?;
-    let commits = repo
-        .commits_with_progress(COMMIT_LIMIT, |done| {
-            tx.send(LoadMessage::Progress { done, total: None }).is_ok()
-        })
-        .unwrap_or_default();
+    let progress = |done: usize| tx.send(LoadMessage::Progress { done, total: None }).is_ok();
+    let commits = if all_branches {
+        repo.commits_all_branches_with_progress(COMMIT_LIMIT, progress)
+    } else {
+        repo.commits_with_progress(COMMIT_LIMIT, progress)
+    }
+    .unwrap_or_default();
 
     tx.send(LoadMessage::Stage(LoadStage::Graph))?;
     let graph_rows = GraphEngine::build(&commits);

@@ -14,8 +14,11 @@ use crate::graph::layout::{GraphEngine, GraphRow};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryScope {
-    /// Everything reachable from HEAD, as loaded at startup.
-    All,
+    /// Everything reachable from HEAD, as loaded at startup. Default.
+    Head,
+    /// Everything reachable from HEAD or any local branch tip: the `--all`
+    /// startup flag, or [`AppState::toggle_all_branches_history`].
+    AllBranches,
     /// Only the commits that touched this path.
     File(String),
 }
@@ -45,14 +48,20 @@ impl Status {
     }
 }
 
-/// The full history, parked while a single file's history is on screen.
+/// The view parked while a scope (a file's history, or all branches) is on
+/// screen.
 ///
-/// Scoping to a file replaces the commit list rather than filtering a view of
-/// it, because the graph rows, the minimap and the selection are all index
-/// aligned with `commits` and would otherwise need to be recomputed on the way
-/// back. Holding one copy costs memory only while scoped, and it is dropped the
-/// moment full history is restored.
+/// Scoping replaces the commit list rather than filtering a view of it,
+/// because the graph rows, the minimap and the selection are all index
+/// aligned with `commits` and would otherwise need to be recomputed on the
+/// way back. Holding one copy costs memory only while scoped, and it is
+/// dropped the moment the parked view is restored.
 struct HistorySnapshot {
+    /// The scope the parked view was showing: [`HistoryScope::Head`]
+    /// normally, [`HistoryScope::AllBranches`] when the app started with
+    /// `--all`. Restored by `close_history` so the pane title and the toggle
+    /// state keep describing what is actually on screen.
+    scope: HistoryScope,
     commits: Vec<CommitInfo>,
     graph_rows: Vec<GraphRow>,
     minimap: Vec<char>,
@@ -168,7 +177,9 @@ pub struct AppState {
     detail: Option<DetailWorker>,
     /// Which commits the graph pane is currently showing.
     pub history: HistoryScope,
-    /// Full history, parked while `history` is scoped to a file.
+    /// The view parked while `history` is scoped to a file or to all
+    /// branches: HEAD history normally, all-branches history when the app
+    /// started with `--all`.
     saved_history: Option<Box<HistorySnapshot>>,
     /// Whether the `?` keymap overlay is up. Independent of `view_mode` so
     /// dismissing it returns to whatever pane was underneath.
@@ -187,19 +198,23 @@ pub struct AppState {
 
 impl Default for AppState {
     fn default() -> Self {
-        Self::new(None)
+        Self::new(None, false)
     }
 }
 
 impl AppState {
-    pub fn new(path: Option<PathBuf>) -> Self {
+    /// `start_all_branches` mirrors the `--all` CLI flag: the initial
+    /// background load then walks every local branch tip instead of HEAD only
+    /// (see `loading::spawn`), and the graph opens with `history` already
+    /// [`HistoryScope::AllBranches`].
+    pub fn new(path: Option<PathBuf>, start_all_branches: bool) -> Self {
         let search_path =
             path.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
         let (repo_state, loading, load_rx, detail) = match GitRepository::open(&search_path) {
             Ok(repo) => {
                 let git_dir = repo.path();
-                let load_rx = loading::spawn(git_dir.clone());
+                let load_rx = loading::spawn(git_dir.clone(), start_all_branches);
                 let label = repo_label(&git_dir, &search_path);
                 (
                     RepoState::Loading(repo),
@@ -236,7 +251,11 @@ impl AppState {
             loading,
             load_rx,
             detail,
-            history: HistoryScope::All,
+            history: if start_all_branches {
+                HistoryScope::AllBranches
+            } else {
+                HistoryScope::Head
+            },
             saved_history: None,
             show_help: false,
             graph_pane: Rect::default(),
@@ -562,6 +581,7 @@ impl AppState {
             }
             Payload::Diff(lines) => self.diff_lines = lines,
             Payload::FileHistory { path, commits } => self.enter_file_history(path, commits),
+            Payload::AllBranchesHistory(commits) => self.enter_all_branches_history(commits),
         }
     }
 
@@ -696,20 +716,67 @@ impl AppState {
         });
     }
 
-    /// Swap the graph pane over to a single file's history, parking the full
-    /// history so `Esc` can put it back.
+    /// Toggle the graph pane between HEAD-only and every local branch. Bound
+    /// to `a` in the graph pane. A second press (or `Esc`) closes it the same
+    /// way closing a file's history does, since both are the one scoped view
+    /// the graph pane can show at a time.
+    ///
+    /// See [`crate::git::repository::GitRepository::commits_all_branches_with_progress`]
+    /// for why this is local branches only, not `git log --all`'s full set.
+    pub fn toggle_all_branches_history(&mut self) {
+        if self.history == HistoryScope::AllBranches {
+            self.close_history();
+            return;
+        }
+        self.request(Request::AllBranchesHistory(loading::COMMIT_LIMIT));
+    }
+
+    /// Swap the graph pane over to a single file's history, parking full
+    /// history so `close_history` can put it back.
     fn enter_file_history(&mut self, path: String, commits: Vec<CommitInfo>) {
         if commits.is_empty() {
             self.error(format!("No commits in this history touched {path}"));
             return;
         }
+        // Linear rows, not `GraphEngine::build`: see `build_linear` for why a
+        // filtered list cannot be laid out as a graph.
+        let graph_rows = GraphEngine::build_linear(&commits);
+        self.enter_scoped_history(HistoryScope::File(path), commits, graph_rows);
+    }
 
-        // Only the first scoping saves a snapshot. Jumping straight from one
-        // file's history to another must not overwrite it with an already
-        // scoped list, or `Esc` would land on the previous file rather than on
-        // full history.
+    /// Swap the graph pane over to the all-branches history, parking
+    /// whatever was underneath (HEAD history, or itself under `--all`) so
+    /// `close_history` can put it back.
+    fn enter_all_branches_history(&mut self, commits: Vec<CommitInfo>) {
+        if commits.is_empty() {
+            self.error("No commits in this repository");
+            return;
+        }
+        // Real topology, unlike file history: parents are still exactly the
+        // commit's real parents (nothing was filtered out commit-by-commit),
+        // so the ordinary graph layout applies, merges and all.
+        let graph_rows = GraphEngine::build(&commits);
+        self.enter_scoped_history(HistoryScope::AllBranches, commits, graph_rows);
+    }
+
+    /// Shared by [`AppState::enter_file_history`] and
+    /// [`AppState::enter_all_branches_history`]: park the view underneath the
+    /// first scope opened, then swap the graph pane's commit list and layout
+    /// over to `commits`/`graph_rows`.
+    fn enter_scoped_history(
+        &mut self,
+        scope: HistoryScope,
+        commits: Vec<CommitInfo>,
+        graph_rows: Vec<GraphRow>,
+    ) {
+        // Only the first scoping saves a snapshot. Jumping from one scoped
+        // view straight to another (file history to all-branches, or from
+        // one file to another) must not overwrite it with an already-scoped
+        // list, or closing would land on the previous scope rather than on
+        // the view the app opened with.
         if self.saved_history.is_none() {
             self.saved_history = Some(Box::new(HistorySnapshot {
+                scope: self.history.clone(),
                 commits: std::mem::take(&mut self.commits),
                 graph_rows: std::mem::take(&mut self.graph_rows),
                 minimap: std::mem::take(&mut self.minimap),
@@ -717,16 +784,14 @@ impl AppState {
             }));
         }
 
-        // Linear rows, not `GraphEngine::build`: see `build_linear` for why a
-        // filtered list cannot be laid out as a graph.
-        self.graph_rows = GraphEngine::build_linear(&commits);
+        self.graph_rows = graph_rows;
         self.commits = commits;
         // The minimap is deliberately empty while scoped. Commit sizes come
         // from the background size pass over the full list, and re-running it
         // for a subset would mean another walk for a decoration; `ui::render`
         // already treats a missing entry as "no minimap column".
         self.minimap = Vec::new();
-        self.history = HistoryScope::File(path);
+        self.history = scope;
         self.list_state.select(Some(0));
         self.view_mode = ViewMode::Graph;
         self.search_results.clear();
@@ -734,9 +799,11 @@ impl AppState {
         self.status = None;
     }
 
-    /// Restore full history. No-op when it is already showing, which is what
-    /// makes it safe to bind to `Esc` in the graph pane.
-    pub fn close_file_history(&mut self) -> bool {
+    /// Restore the view parked when the first scope was opened — HEAD
+    /// history normally, the all-branches history when the app started with
+    /// `--all` — closing whichever scope (a file's history or all-branches)
+    /// is currently open. No-op when nothing is parked.
+    pub fn close_history(&mut self) -> bool {
         let Some(saved) = self.saved_history.take() else {
             return false;
         };
@@ -745,7 +812,7 @@ impl AppState {
         self.graph_rows = saved.graph_rows;
         self.minimap = saved.minimap;
         self.list_state.select(saved.selected);
-        self.history = HistoryScope::All;
+        self.history = saved.scope;
         self.search_results.clear();
         self.search_index = 0;
         self.view_mode = ViewMode::Graph;
