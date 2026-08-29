@@ -10,6 +10,40 @@ const PARALLEL_POLL: Duration = Duration::from_millis(16);
 const MIN_CHUNK: usize = 24;
 const MAX_WORKERS: usize = 8;
 
+/// The starting points of a history walk: which refs seed the revwalk.
+///
+/// The git-layer counterpart of the application's history scope: it says
+/// which refs a walk starts from, not what the UI is showing. A file's
+/// history has no variant of its own — it is a filter over one of these
+/// walks, never a walk in its own right — which is why it is carried
+/// alongside the path instead of derived from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkStart {
+    /// Everything reachable from `HEAD`.
+    Head,
+    /// Everything reachable from `HEAD` or any local branch tip.
+    HeadAndLocalBranches,
+}
+
+impl WalkStart {
+    /// Seed `revwalk` with this start's refs.
+    ///
+    /// `HEAD` is pushed in both cases: on a detached HEAD (mid-rebase, or
+    /// checked out to a bare commit) HEAD names a commit no branch
+    /// necessarily points at, and dropping it would make "all branches"
+    /// silently show less than the HEAD-only walk already did. libgit2
+    /// dedupes a revwalk by oid across every pushed starting point, so a
+    /// commit reachable from two tips still comes out once; nothing here
+    /// needs to deduplicate by hand.
+    fn push_onto(&self, revwalk: &mut git2::Revwalk<'_>) -> Result<(), git2::Error> {
+        revwalk.push_head()?;
+        if *self == WalkStart::HeadAndLocalBranches {
+            revwalk.push_glob("refs/heads/*")?;
+        }
+        Ok(())
+    }
+}
+
 pub struct GitRepository {
     repo: Repository,
 }
@@ -94,14 +128,13 @@ impl GitRepository {
     where
         F: FnMut(usize) -> bool,
     {
-        let mut revwalk = self.repo.revwalk()?;
-        revwalk.push_head()?;
-        self.drain_revwalk(revwalk, max_count, on_progress)
+        self.walk_commits(WalkStart::Head, max_count, on_progress)
     }
 
     /// Commits reachable from `HEAD` *or* any local branch tip: the union
-    /// `git log --all` (restricted to local branches; see below) would show,
-    /// deduplicated so a commit on several branches is yielded once.
+    /// `git log --all` (restricted to local branches; see [`WalkStart`])
+    /// would show, deduplicated so a commit on several branches is yielded
+    /// once.
     ///
     /// Remote-tracking branches are deliberately left out. Fetching without
     /// having yet checked out or merged an update is a common state to be in,
@@ -117,33 +150,25 @@ impl GitRepository {
     where
         F: FnMut(usize) -> bool,
     {
-        let mut revwalk = self.repo.revwalk()?;
-        // Also pushes HEAD: on a detached HEAD (mid-rebase, or checked out to
-        // a bare commit) HEAD names a commit no branch necessarily points at,
-        // and dropping it would make "all branches" silently show less than
-        // the default view already did.
-        revwalk.push_head()?;
-        // libgit2 dedupes a revwalk by oid across every pushed starting
-        // point, so a commit reachable from two branch tips still comes out
-        // once; nothing here needs to deduplicate by hand.
-        revwalk.push_glob("refs/heads/*")?;
-        self.drain_revwalk(revwalk, max_count, on_progress)
+        self.walk_commits(WalkStart::HeadAndLocalBranches, max_count, on_progress)
     }
 
-    /// Shared by both walks above: apply the sort, take up to `max_count`
-    /// commits, and report progress every [`PROGRESS_INTERVAL`] commits. The
-    /// two callers differ only in what they push onto `revwalk` before
-    /// calling this, so the walking, snapshotting and progress reporting
+    /// Shared by both walks above: seed a revwalk from `start`, apply the
+    /// sort, take up to `max_count` commits, and report progress every
+    /// [`PROGRESS_INTERVAL`] commits. The callers differ only in the
+    /// [`WalkStart`], so the walking, snapshotting and progress reporting
     /// cannot drift between "HEAD only" and "all branches".
-    fn drain_revwalk<F>(
+    fn walk_commits<F>(
         &self,
-        mut revwalk: git2::Revwalk<'_>,
+        start: WalkStart,
         max_count: usize,
         mut on_progress: F,
     ) -> Result<Vec<crate::git::commit::CommitInfo>, git2::Error>
     where
         F: FnMut(usize) -> bool,
     {
+        let mut revwalk = self.repo.revwalk()?;
+        start.push_onto(&mut revwalk)?;
         revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
 
         let mut commits = Vec::new();
@@ -164,6 +189,10 @@ impl GitRepository {
     /// Shaped exactly like [`GitRepository::commits`] so the graph engine, the
     /// minimap and every pane consume a file's history through the same code
     /// path as full history; the app swaps one `Vec<CommitInfo>` for another.
+    /// The walk starts from `start`, making it a filter over the walk whose
+    /// commits are on screen: from the all-branches view it walks the local
+    /// branch tips too, so a path that only exists on an unmerged branch
+    /// still finds the commit that introduced it.
     ///
     /// Unlike `commits`, `max_count` cannot bound the walk itself: whether a
     /// commit qualifies is only known after diffing it, so the walk runs until
@@ -178,11 +207,12 @@ impl GitRepository {
     pub fn file_history(
         &self,
         path: &str,
+        start: WalkStart,
         max_count: usize,
     ) -> Result<Vec<crate::git::commit::CommitInfo>, git2::Error> {
         let path = Path::new(path);
         let mut revwalk = self.repo.revwalk()?;
-        revwalk.push_head()?;
+        start.push_onto(&mut revwalk)?;
         revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
 
         let mut commits = Vec::new();

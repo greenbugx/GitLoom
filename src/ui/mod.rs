@@ -40,7 +40,7 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     let graph_title = match &state.history {
         HistoryScope::Head => "GRAPH AREA".to_string(),
         HistoryScope::AllBranches => "GRAPH AREA (ALL BRANCHES)".to_string(),
-        HistoryScope::File(path) => format!("HISTORY OF {path}"),
+        HistoryScope::File { path, .. } => format!("HISTORY OF {path}"),
     };
     let graph_block = Block::bordered().title(graph_title);
 
