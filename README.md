@@ -17,6 +17,7 @@ A fast, lightweight, keyboard-first terminal-based Git history explorer designed
 - **Single-path file history** — scope the graph to one file and walk only the commits that changed it.
 - **Incremental search** over commit summaries, authors, and OIDs.
 - **Copy a commit hash** with `y`, using OSC 52 so it works over SSH too.
+- **Unbounded HEAD history** — commit history loads a page at a time and keeps loading automatically as you scroll, instead of stopping at a fixed commit ceiling.
 
 ## Screenshots
 

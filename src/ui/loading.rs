@@ -67,6 +67,32 @@ pub fn status_line(load: &LoadingState) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The status-bar line shown while a background page loads — pagination's
+/// counterpart to `status_line`, used once the graph already has commits on
+/// screen and the full-screen loader (and its own `LoadingState`) no longer
+/// applies. Takes the raw frame counter directly rather than a
+/// `LoadingState`, since `AppState.loading` is `None` throughout background
+/// pagination.
+///
+/// `searching_for`, when set, means this page was requested by a search that
+/// came up empty against what's loaded so far (see `AppState::execute_search`
+/// and `retry_search_if_pending`): the message says so, rather than a bare
+/// "loading more" that would leave the search silently stalled from the
+/// user's point of view while pages load looking for their query.
+pub fn loading_more_line(frame: usize, searching_for: Option<&str>) -> Line<'static> {
+    let spinner = SPINNER[frame % SPINNER.len()].to_string();
+    let label = match searching_for {
+        Some(query) => format!("Searching \"{query}\"… loading more history"),
+        None => "Loading more history…".to_string(),
+    };
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(spinner, Style::default().fg(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled(label, Style::default().fg(Color::White)),
+    ])
+}
+
 fn bar_spans(load: &LoadingState) -> Vec<Span<'static>> {
     let bar = progress_bar(BAR_WIDTH, load.ratio(), load.frame);
     let mut spans = vec![Span::styled(bar, Style::default().fg(Color::Cyan))];

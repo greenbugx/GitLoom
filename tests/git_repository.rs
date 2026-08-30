@@ -306,8 +306,8 @@ fn measure_whether_revwalk_pays_full_history_cost_up_front() {
     const DEPTH: usize = 5_000;
     const REPETITIONS: u32 = 5;
 
-    let repo_dir = build_linear_history(DEPTH);
-    let repo_path = repo_dir.path().to_path_buf();
+    let (repo, _oids) = TestRepo::build_long_history_fixture(DEPTH);
+    let repo_path = repo.path().to_path_buf();
 
     let git_repo = GitRepository::open(&repo_path).expect("open linear-history repo");
     let small_take = 20;
@@ -347,63 +347,6 @@ fn measure_whether_revwalk_pays_full_history_cost_up_front() {
          (near 1.0 => full cost paid up front; near 0.0 => lazy)",
         small_avg.as_secs_f64() / full_avg.as_secs_f64().max(1e-9)
     );
-}
-
-/// Builds `depth` linear commits in total (the first is the root, with no
-/// parent; the rest have exactly one parent each) on `main`, each touching
-/// the same file so the diffs stay cheap and the timing reflects
-/// revwalk/commit-object cost rather than diff cost. Returns the
-/// `TempDir` only; the `git2::Repository` handle is dropped internally so
-/// the caller reopens fresh from disk via `GitRepository::open`, matching
-/// how the real app always opens a repo it didn't just write to.
-fn build_linear_history(depth: usize) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("create temp dir for linear-history repo");
-    let repo = git2::Repository::init(dir.path()).expect("git init");
-    repo.set_head("refs/heads/main")
-        .expect("point HEAD at main");
-
-    let mut clock: i64 = 1_700_000_000;
-    let mut last_oid: Option<git2::Oid> = None;
-
-    for i in 0..depth {
-        std::fs::write(dir.path().join("counter.txt"), i.to_string()).expect("write counter file");
-
-        let mut index = repo.index().expect("open index");
-        index
-            .add_path(std::path::Path::new("counter.txt"))
-            .expect("stage counter file");
-        index.write().expect("write index");
-        let tree_oid = index.write_tree().expect("write tree");
-        let tree = repo.find_tree(tree_oid).expect("find tree");
-
-        clock += 1;
-        let sig = git2::Signature::new(
-            "Test Author",
-            "author@example.test",
-            &git2::Time::new(clock, 0),
-        )
-        .expect("build signature");
-
-        let parents: Vec<git2::Commit> = match last_oid {
-            Some(oid) => vec![repo.find_commit(oid).expect("find previous commit")],
-            None => Vec::new(),
-        };
-        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-
-        let oid = repo
-            .commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                &format!("chore: step {i}"),
-                &tree,
-                &parent_refs,
-            )
-            .expect("create commit");
-        last_oid = Some(oid);
-    }
-
-    dir
 }
 
 /// Sanity check on the fixture builder itself: all five distinct oids show
