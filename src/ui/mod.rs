@@ -37,8 +37,22 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     // filtered history looks like a repository that has lost most of its
     // commits. Built as an owned string so the block borrows nothing from
     // `state`, leaving it free to be mutated just below.
+    //
+    // For HEAD history specifically, it also carries the pagination status:
+    // "· loading more" while a background page is in flight, or "· end of
+    // history" once the walk is exhausted. Silent while more could still be
+    // loading (the common case, mid-scroll) rather than implying either
+    // state before it's actually known.
     let graph_title = match &state.history {
-        HistoryScope::Head => "GRAPH AREA".to_string(),
+        HistoryScope::Head => {
+            if state.loading_more {
+                "GRAPH AREA · loading more…".to_string()
+            } else if state.history_exhausted {
+                "GRAPH AREA · end of history".to_string()
+            } else {
+                "GRAPH AREA".to_string()
+            }
+        }
         HistoryScope::AllBranches => "GRAPH AREA (ALL BRANCHES)".to_string(),
         HistoryScope::File { path, .. } => format!("HISTORY OF {path}"),
     };
@@ -283,6 +297,13 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         Paragraph::new(format!("/{}", state.search_query)).block(bottom_block)
     } else if let Some(load) = &state.loading {
         Paragraph::new(loading::status_line(load)).block(bottom_block)
+    } else if state.loading_more {
+        let searching_for = state.search_pending_query();
+        Paragraph::new(loading::loading_more_line(
+            state.loading_more_frame,
+            searching_for,
+        ))
+        .block(bottom_block)
     } else if let Some(status) = &state.status {
         // Surfaces what a key press would otherwise have swallowed: a failed
         // load, or a confirmation like a yanked hash.

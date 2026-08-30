@@ -38,10 +38,17 @@ does.
 **Application state**
 
 - `src/app/state.rs`: The core `AppState` that manages UI state, currently
-  selected commit, active view modes, search results, and the file-history scope.
+  selected commit, active view modes, search results, and the graph's history
+  scope via `HistoryScope` (HEAD, all local branches, or a single file's
+  history). Scoped views park the previous commit list in a `HistorySnapshot`
+  so closing restores the original list and selection without re-walking.
 - `src/app/detail.rs`: The worker thread that fetches commit details, diffs, and
   changed-file lists off the UI thread.
-- `src/app/loading.rs`: The worker that walks history when a repository is opened.
+- `src/app/loading.rs`: The worker that walks history when a repository is
+  opened. HEAD history is paginated: it loads one `PAGE_SIZE`-commit page up
+  front, then stays alive and answers `LoadRequest::NextPage` by resuming the
+  same `git2::Revwalk`, so the app is never stuck with a fixed ceiling on how
+  much history it can reach. An `--all` startup load is still one-shot.
 - `src/app/details_text.rs`: Formats a commit into the details pane's lines.
 
 **Git layer**
@@ -60,6 +67,28 @@ does.
 - `src/ui/help.rs`: The `?` overlay, and the keymap table itself.
 - `src/ui/loading.rs`: The loading animation.
 - `src/clipboard.rs`: OSC 52 clipboard writes.
+
+**Test infrastructure**
+
+- `tests/common/mod.rs`: Builds small, real repositories on disk with `git2`
+  (the `TestRepo` builder) so integration tests exercise the git layer,
+  search, minimap, and graph parent-handling against actual commit/tree/ref
+  objects instead of only hand-built `CommitInfo`s. Also builds the deep
+  linear history (`build_long_history_fixture`) used by the ignored revwalk
+  benchmark and by `tests/pagination.rs`.
+- `tests/graph_layout.rs`: Pure topology tests for `GraphEngine::build` —
+  linear histories, single and multiple branches, merges, and complicated
+  merge topologies.
+- `tests/git_repository.rs`: Integration tests that open a real repository
+  and exercise the git layer end-to-end: commit walks, topological sort
+  guarantees, ref map badges, file history (including mode-only changes and
+  unmerged branches), search, minimap alignment, and the `--all` startup
+  flag.
+- `tests/pagination.rs`: Drives `AppState` against a repository deep enough
+  to force more than one page — the page boundary, graph/minimap staying
+  aligned with `commits` after an append, search continuing past the first
+  page instead of reporting "not found" early, and the race where a page
+  lands after the graph has scoped away from HEAD.
 
 ## Invariants worth knowing
 
@@ -82,6 +111,20 @@ A handful of rules are load-bearing, enforced by tests, and easy to trip over:
   repainting a pane the user has already left, and `cancel()` stops a closed pane
   being repopulated. Each has its own test in `src/app/detail.rs`; please don't
   collapse them into one mechanism.
+- **`LoadWorker` page requests accumulate; they are never coalesced.** This
+  is the opposite of `DetailWorker`'s rule above, and deliberately so:
+  coalescing keeps only the newest of a backlog, which is correct for "redraw
+  the pane for the commit I'm on now" but wrong for pagination — two
+  `NextPage` requests sent before the first is answered both need a page
+  back, or the second page silently never loads and history looks shorter
+  than it is.
+- **A HEAD-history page can land after the graph has scoped away from it.**
+  If the user scopes to a file's history or all branches while a `NextPage`
+  request is still in flight, the page that eventually arrives must go into
+  the parked `HistorySnapshot`, not `AppState.commits` — which by then holds
+  the scoped list, not HEAD's. `apply`'s `LoadMessage::PageReady` arm checks
+  `history != HistoryScope::Head` for exactly this reason before deciding
+  where to append.
 - **The terminal is restored by a `Drop` guard, not by code at the end of
   `run`.** `run` holds it as `let _guard = TerminalGuard::enter()?`; the `_guard`
   name is load-bearing, since `let _ = ` drops the value immediately and would
@@ -94,6 +137,15 @@ A handful of rules are load-bearing, enforced by tests, and easy to trip over:
 - **Line endings are LF.** `.gitattributes` normalizes on checkin. If you develop
   across Windows and a Linux container, review with
   `git diff --ignore-cr-at-eol` so real changes aren't buried in `^M`.
+- **Scoped history parks the previous view.** `HistoryScope::File` and
+  `HistoryScope::AllBranches` replace the commit list rather than filtering it,
+  because the graph rows, minimap, and selection are all index-aligned with
+  `commits` and would need recomputation otherwise. A `HistorySnapshot` holds
+  the parked view; only the first scope open saves a snapshot, so switching
+  from one scope to another (e.g. file history to all-branches) does not
+  overwrite the snapshot. `close_history` restores the parked view exactly,
+  selection included. `toggle_all_branches_history` uses this mechanism so
+  repeated presses swap between the two views without re-walking.
 
 ## Pull Request Process
 
@@ -110,8 +162,14 @@ A handful of rules are load-bearing, enforced by tests, and easy to trip over:
    - `docs:` for documentation changes
    - `refactor:` for code refactoring
    - `test:` for tests
+   - `ci:` for CI and workflow changes
    - `chore:` for everything else
-7. Open your pull request!
+7. Open your pull request! A
+   [pull request template](.github/pull_request_template.md) is provided —
+   fill in what applies. Use the
+   [bug report](.github/ISSUE_TEMPLATE/bug_report.md) or
+   [feature request](.github/ISSUE_TEMPLATE/feature_request.md) templates
+   when opening issues.
 
 CI runs three jobs. Build and test go across `ubuntu-latest` and
 `windows-latest`, because the event loop is platform-sensitive: Windows reports a

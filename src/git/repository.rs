@@ -184,6 +184,54 @@ impl GitRepository {
         Ok(commits)
     }
 
+    /// A revwalk seeded from `start` and sorted the same way
+    /// [`GitRepository::walk_commits`] sorts every walk in this module, ready
+    /// to be driven page by page with [`GitRepository::next_page`].
+    ///
+    /// Split out rather than folded into `walk_commits` because that method
+    /// takes the `Revwalk` by value and fully drains it in one call — exactly
+    /// what paging cannot do. If the sort or seeding ever changes, change it
+    /// in both places.
+    pub fn walk_revwalk(&self, start: WalkStart) -> Result<git2::Revwalk<'_>, git2::Error> {
+        let mut revwalk = self.repo.revwalk()?;
+        start.push_onto(&mut revwalk)?;
+        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+        Ok(revwalk)
+    }
+
+    /// Pull up to `page_size` more commits from an already-positioned
+    /// `revwalk` (see [`GitRepository::walk_revwalk`]), resuming exactly
+    /// where the walk left off since `Revwalk` is a plain iterator with no
+    /// separate cursor to rewind.
+    ///
+    /// Returns the page and whether it was the last one: `true` when fewer
+    /// than `page_size` commits were left to give, `false` when a full page
+    /// came back and more may still follow. Progress is reported the same
+    /// way [`GitRepository::walk_commits`] does, every [`PROGRESS_INTERVAL`]
+    /// commits and once more at the end.
+    pub fn next_page<F>(
+        &self,
+        revwalk: &mut git2::Revwalk<'_>,
+        page_size: usize,
+        mut on_progress: F,
+    ) -> Result<(Vec<crate::git::commit::CommitInfo>, bool), git2::Error>
+    where
+        F: FnMut(usize) -> bool,
+    {
+        let mut commits = Vec::new();
+        for oid in revwalk.by_ref().take(page_size) {
+            let commit = self.repo.find_commit(oid?)?;
+            commits.push(commit_info(&commit));
+
+            if commits.len().is_multiple_of(PROGRESS_INTERVAL) && !on_progress(commits.len()) {
+                return Ok((commits, false));
+            }
+        }
+        on_progress(commits.len());
+        let is_last = commits.len() < page_size;
+        Ok((commits, is_last))
+    }
+
     /// The commits that touched `path`, newest first, capped at `max_count`.
     ///
     /// Shaped exactly like [`GitRepository::commits`] so the graph engine, the

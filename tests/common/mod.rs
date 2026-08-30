@@ -4,6 +4,7 @@
 //!
 //! Timestamps and the author/committer identity are fixed so tests are
 //! deterministic and don't depend on the machine's git config.
+#![allow(dead_code)]
 
 use git2::{Repository, Signature};
 use std::path::Path;
@@ -93,6 +94,71 @@ impl TestRepo {
 
     pub fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// A long, purely linear history: `depth` commits, each touching the
+    /// same file, with no branches or merges.
+    ///
+    /// Exists for two different reasons depending on who calls it: the
+    /// `#[ignore]`d revwalk benchmark in `tests/git_repository.rs` needs a
+    /// history deep enough to make an up-front full-history cost visible,
+    /// and the pagination tests in `tests/pagination.rs` need one deep
+    /// enough to force more than one page. Both only care about depth and
+    /// topology, not content, so one builder serves both rather than each
+    /// keeping its own copy.
+    ///
+    /// Deliberately bypasses `commit_file`: that goes through
+    /// `self.repo.index()` and re-reads/re-writes the whole index on every
+    /// call, which is fine for the handful of commits every other fixture
+    /// here makes but turns quadratic at a few thousand. This writes the one
+    /// file directly into the object database with `Repository::blob` and
+    /// touches only that one entry through a `TreeBuilder`, so the cost per
+    /// commit stays flat as `depth` grows.
+    pub fn build_long_history_fixture(depth: usize) -> (Self, Vec<String>) {
+        let mut repo = Self::init();
+        let mut oids = Vec::with_capacity(depth);
+
+        for i in 0..depth {
+            let ts = repo.next_timestamp();
+            let sig = Self::signature_at(ts);
+
+            let blob_oid = repo
+                .repo
+                .blob(i.to_string().as_bytes())
+                .expect("write counter blob");
+            let parent_commits: Vec<git2::Commit> = match repo.repo.head() {
+                Ok(head) => vec![head.peel_to_commit().expect("HEAD peels to a commit")],
+                Err(_) => Vec::new(), // first commit in the repo: no parent
+            };
+            let parent_tree = parent_commits
+                .first()
+                .map(|commit| commit.tree().expect("previous commit has a tree"));
+            let mut builder = repo
+                .repo
+                .treebuilder(parent_tree.as_ref())
+                .expect("open treebuilder");
+            builder
+                .insert("counter.txt", blob_oid, REGULAR)
+                .expect("insert counter file into tree");
+            let tree_oid = builder.write().expect("write tree");
+            let tree = repo.repo.find_tree(tree_oid).expect("find written tree");
+
+            let parent_refs: Vec<&git2::Commit> = parent_commits.iter().collect();
+            let oid = repo
+                .repo
+                .commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    &format!("chore: step {i}"),
+                    &tree,
+                    &parent_refs,
+                )
+                .expect("create commit");
+            oids.push(oid.to_string());
+        }
+
+        (repo, oids)
     }
 
     fn next_timestamp(&mut self) -> i64 {

@@ -1,12 +1,11 @@
 use crate::app::detail::{DetailWorker, Payload, Request};
-use crate::app::loading::{self, LoadMessage, LoadingState};
+use crate::app::loading::{self, LoadMessage, LoadWorker, LoadingState};
 use crate::git::commit::CommitInfo;
 use crate::git::repository::{Branch, GitRepository, Ref, RefName, RepoInfo, RepoRefs, WalkStart};
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, TryRecvError};
 use unicode_width::UnicodeWidthStr;
 
 use crate::git::commit::CommitDetails;
@@ -177,6 +176,11 @@ pub struct AppState {
     pub is_searching: bool,
     pub search_results: Vec<usize>,
     pub search_index: usize,
+    /// `true` when a search came up empty against what's loaded so far and
+    /// is waiting on more history before it can honestly report "not found".
+    /// Checked by `retry_search_if_pending`, which `apply` calls whenever a
+    /// page lands.
+    search_pending: bool,
     /// Point-in-time OID -> ref badges snapshot, loaded once at init.
     /// `GitRepository::ref_map` is NOT live and must be rebuilt if a
     /// future refresh/reload command is added.
@@ -184,10 +188,31 @@ pub struct AppState {
     /// Precomputed minimap sparkline char per commit (indexed by commit order).
     /// Arrives together with the commits, so it is only empty without history.
     pub minimap: Vec<char>,
-    /// Progress of the background load; `None` when nothing is loading.
+    /// Progress of the background load; `None` when nothing is loading. Also
+    /// `None` (rather than an indeterminate "loading more" state) while a
+    /// later page loads in the background — see `loading_more` for that.
     pub loading: Option<LoadingState>,
-    /// Progress channel from the loading thread, dropped when the load ends.
-    load_rx: Option<Receiver<LoadMessage>>,
+    /// Handle to the loading thread: requests pages, receives messages.
+    /// Dropped once the walk is exhausted or the thread has otherwise ended
+    /// (an error, or — for an `--all` startup load — its one-shot
+    /// completion).
+    load: Option<LoadWorker>,
+    /// `true` once a `LoadMessage::PageReady`/`Ready` has reported
+    /// `is_last`, or once `load` has gone. No further `NextPage` request
+    /// should be sent, and the UI can say so plainly instead of leaving the
+    /// user unsure whether more history might still show up. Only ever
+    /// meaningful for `HistoryScope::Head`: see `request_more_history`.
+    pub history_exhausted: bool,
+    /// `true` while a background page (not the initial load) is in flight.
+    /// Distinct from `is_loading()`, which covers only the first page behind
+    /// the full progress screen: this instead drives a small inline
+    /// indicator, since `commits` is already non-empty at this point.
+    pub loading_more: bool,
+    /// Animation frame for the `loading_more` spinner, advanced by `tick()`.
+    /// Separate from `loading.frame`: that one only exists while `loading`
+    /// is `Some`, i.e. during the full-screen load, and is `None` throughout
+    /// background pagination.
+    pub loading_more_frame: usize,
     /// Detail/files/diff/file-history fetches, run off the UI thread. `None`
     /// only when no repository could be opened at all.
     detail: Option<DetailWorker>,
@@ -221,21 +246,21 @@ impl Default for AppState {
 impl AppState {
     /// `start_all_branches` mirrors the `--all` CLI flag: the initial
     /// background load then walks every local branch tip instead of HEAD only
-    /// (see `loading::spawn`), and the graph opens with `history` already
+    /// (see [`LoadWorker::spawn`]), and the graph opens with `history` already
     /// [`HistoryScope::AllBranches`].
     pub fn new(path: Option<PathBuf>, start_all_branches: bool) -> Self {
         let search_path =
             path.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        let (repo_state, loading, load_rx, detail) = match GitRepository::open(&search_path) {
+        let (repo_state, loading, load, detail) = match GitRepository::open(&search_path) {
             Ok(repo) => {
                 let git_dir = repo.path();
-                let load_rx = loading::spawn(git_dir.clone(), start_all_branches);
+                let load = LoadWorker::spawn(git_dir.clone(), start_all_branches);
                 let label = repo_label(&git_dir, &search_path);
                 (
                     RepoState::Loading(repo),
                     Some(LoadingState::new(label)),
-                    Some(load_rx),
+                    Some(load),
                     Some(DetailWorker::spawn(git_dir)),
                 )
             }
@@ -262,10 +287,14 @@ impl AppState {
             is_searching: false,
             search_results: Vec::new(),
             search_index: 0,
+            search_pending: false,
             ref_map: HashMap::new(),
             minimap: Vec::new(),
             loading,
-            load_rx,
+            load,
+            history_exhausted: false,
+            loading_more: false,
+            loading_more_frame: 0,
             detail,
             history: if start_all_branches {
                 HistoryScope::AllBranches
@@ -281,11 +310,14 @@ impl AppState {
     }
 
     /// True while anything is running that will change the screen without a
-    /// keypress: the initial load, or an in-flight detail fetch. The main loop
-    /// polls with a timeout while this holds instead of blocking on input, so
-    /// results appear as they land.
+    /// keypress: the initial load, an in-flight detail fetch, or a page of
+    /// history loading in the background. The main loop polls with a timeout
+    /// while this holds instead of blocking on input, so results appear as
+    /// they land.
     pub fn is_busy(&self) -> bool {
-        self.is_loading() || self.detail.as_ref().is_some_and(DetailWorker::is_busy)
+        self.is_loading()
+            || self.loading_more
+            || self.detail.as_ref().is_some_and(DetailWorker::is_busy)
     }
 
     /// Placeholder text for a pane whose contents are still being fetched.
@@ -300,6 +332,15 @@ impl AppState {
         self.loading.is_some()
     }
 
+    /// The query a pending search is waiting on more history for, if any —
+    /// used by `ui::loading::loading_more_line` to word the status-bar
+    /// spinner around a search instead of a bare "loading more" when that's
+    /// what triggered this particular page request. `None` whenever
+    /// `loading_more` is true for an ordinary scroll-triggered page instead.
+    pub fn search_pending_query(&self) -> Option<&str> {
+        self.search_pending.then_some(self.search_query.as_str())
+    }
+
     fn notice(&mut self, message: impl Into<String>) {
         self.status = Some(Status::Notice(message.into()));
     }
@@ -312,36 +353,40 @@ impl AppState {
         if let Some(load) = &mut self.loading {
             load.tick();
         }
+        if self.loading_more {
+            self.loading_more_frame = self.loading_more_frame.wrapping_add(1);
+        }
     }
 
     pub fn poll_load(&mut self) {
-        let Some(rx) = &self.load_rx else {
+        let Some(load) = &self.load else {
             return;
         };
 
+        // Drained into a `Vec` first rather than applied inline: `poll`
+        // borrows `self.load` immutably for the duration of the closure, and
+        // `apply` needs `&mut self` (it writes `self.commits`, requests the
+        // next page, and so on).
         let mut messages = Vec::new();
-        let mut finished = false;
-        loop {
-            match rx.try_recv() {
-                Ok(message) => messages.push(message),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    finished = true;
-                    break;
-                }
-            }
-        }
+        let finished = !load.poll(|message| messages.push(message));
 
         for message in messages {
             self.apply(message);
         }
 
         if finished {
-            self.load_rx = None;
+            self.load = None;
             self.loading = None;
+            self.loading_more = false;
+            // A worker gone without a reported `Failed` (a panic, not a
+            // clean exit) is as dead as an explicit failure: no further page
+            // will ever arrive, so say so instead of leaving the UI
+            // expecting one that isn't coming.
+            self.history_exhausted = true;
             if matches!(self.repo_state, RepoState::Loading(_)) {
                 self.repo_state = RepoState::Error("failed to read repository".to_string());
             }
+            self.retry_search_if_pending();
         }
     }
 
@@ -358,27 +403,117 @@ impl AppState {
                     load.total = total;
                 }
             }
-            LoadMessage::Ready(data) => {
-                let data = *data;
-                self.commits = data.commits;
-                self.graph_rows = data.graph_rows;
-                self.ref_map = data.ref_map;
-                self.minimap = data.minimap;
+            LoadMessage::Ready { init, page } => {
+                let init = *init;
+                let page = *page;
+                self.commits = page.commits;
+                self.graph_rows = page.graph_rows;
+                self.ref_map = init.ref_map;
+                self.minimap = page.minimap;
+                self.history_exhausted = page.is_last;
                 if !self.commits.is_empty() {
                     self.list_state.select(Some(0));
                 }
                 let previous = std::mem::replace(&mut self.repo_state, RepoState::None);
                 self.repo_state = match previous {
-                    RepoState::Loading(repo) => RepoState::Loaded(repo, data.info),
+                    RepoState::Loading(repo) => RepoState::Loaded(repo, init.info),
                     other => other,
                 };
                 self.loading = None;
             }
-            LoadMessage::Failed(err) => {
-                self.repo_state = RepoState::Error(err);
-                self.loading = None;
-                self.load_rx = None;
+            LoadMessage::PageReady(page) => {
+                let page = *page;
+                self.history_exhausted = page.is_last;
+                self.loading_more = false;
+                // A page can still land after the graph pane has scoped away
+                // from HEAD (a file's history, or all branches opened while
+                // this request was already in flight): `self.commits` is the
+                // scoped list in that case, not the real HEAD history, so
+                // the page belongs in the parked snapshot instead — it is
+                // spliced back in whole by `close_history` the moment HEAD
+                // history is on screen again.
+                match &mut self.saved_history {
+                    Some(saved) if self.history != HistoryScope::Head => {
+                        saved.commits.extend(page.commits);
+                        saved.graph_rows.extend(page.graph_rows);
+                        saved.minimap.extend(page.minimap);
+                    }
+                    _ => {
+                        self.commits.extend(page.commits);
+                        self.graph_rows.extend(page.graph_rows);
+                        self.minimap.extend(page.minimap);
+                    }
+                }
+                self.retry_search_if_pending();
             }
+            LoadMessage::Failed(err) => {
+                // A failure mid-pagination (rare: the repository would have
+                // to become unreadable between pages) still leaves the
+                // commits already loaded on screen; only the initial load
+                // failing clears `repo_state` down to an error, matching
+                // what happened here before pagination existed.
+                if matches!(self.repo_state, RepoState::Loading(_)) {
+                    self.repo_state = RepoState::Error(err);
+                } else {
+                    self.error(err);
+                }
+                self.loading = None;
+                self.loading_more = false;
+                self.history_exhausted = true;
+                self.load = None;
+                // Nothing more will ever arrive to retry against: resolve a
+                // pending search now rather than leaving it waiting forever
+                // on a page that is never coming.
+                self.retry_search_if_pending();
+            }
+        }
+    }
+
+    /// Ask the loading thread for the next page of HEAD history, if there is
+    /// one to ask for and nothing is already in flight.
+    ///
+    /// Called whenever the selection moves close enough to the end of what's
+    /// loaded that the user might run out of history to scroll into (see
+    /// `next_commit`, `step_commit_and_follow`, `go_last` and `page`), not
+    /// only from a dedicated "load more" action: pagination should be
+    /// invisible in the common case of just scrolling down.
+    fn request_more_history(&mut self) {
+        if self.history_exhausted || self.loading_more {
+            return;
+        }
+        // Scoped histories (a file's history, or all branches) are not
+        // paginated; asking here would either hand a `NextPage` to a worker
+        // that isn't listening (an `--all` startup load: the request side is
+        // never wired up in that mode) or extend `commits` past what
+        // `graph_rows` and `minimap` — parked in `saved_history`, not live —
+        // could stay aligned with.
+        if self.history != HistoryScope::Head {
+            return;
+        }
+        let Some(load) = &self.load else {
+            return;
+        };
+        if load.request_next_page() {
+            self.loading_more = true;
+        } else {
+            // The thread is gone without ever reporting `Failed` or
+            // exhaustion (a panic). Treat it the same as exhaustion: there
+            // is nobody left to ask, so a pending search has to be resolved
+            // right here — nothing else will ever call it back in.
+            self.history_exhausted = true;
+            self.load = None;
+            self.retry_search_if_pending();
+        }
+    }
+
+    /// `true` when the selection is close enough to the end of what's loaded
+    /// that the next page should already be on its way, regardless of which
+    /// key moved it there.
+    fn near_loaded_end(&self) -> bool {
+        const NEAR_BOTTOM: usize = 50;
+        match self.list_state.selected() {
+            Some(selected) => selected + NEAR_BOTTOM >= self.commits.len(),
+            None => false,
         }
     }
 
@@ -387,6 +522,9 @@ impl AppState {
             return;
         }
         step_selection(&mut self.list_state, self.commits.len(), 1);
+        if self.near_loaded_end() {
+            self.request_more_history();
+        }
     }
 
     pub fn previous_commit(&mut self) {
@@ -404,6 +542,9 @@ impl AppState {
             return;
         }
         step_selection(&mut self.list_state, self.commits.len(), direction);
+        if self.near_loaded_end() {
+            self.request_more_history();
+        }
         self.refresh_view();
     }
 
@@ -441,11 +582,17 @@ impl AppState {
     }
 
     /// `G`: the bottom of whatever currently has focus.
+    ///
+    /// In the graph pane this jumps to the last *loaded* commit, which is
+    /// also exactly the moment more history should be requested: landing on
+    /// what looks like the end of the repository is precisely when the user
+    /// is most likely to want to keep going past it.
     pub fn go_last(&mut self) {
         match self.view_mode {
             ViewMode::Graph => {
                 if !self.commits.is_empty() {
                     self.list_state.select(Some(self.commits.len() - 1));
+                    self.request_more_history();
                 }
             }
             ViewMode::Refs => {
@@ -483,6 +630,9 @@ impl AppState {
                     current.saturating_sub(page)
                 };
                 self.list_state.select(Some(target));
+                if direction > 0 && self.near_loaded_end() {
+                    self.request_more_history();
+                }
             }
             ViewMode::Refs => {
                 // Stepping repeatedly reuses the header-skipping logic instead
@@ -885,6 +1035,14 @@ impl AppState {
         self.search_index = 0;
         self.view_mode = ViewMode::Graph;
         self.status = None;
+        // A search left pending before this scope was opened could have had
+        // pages land for it while scoped away (see `apply`'s `PageReady`
+        // arm, which routes them into this same snapshot instead of
+        // `self.commits`). Now that they're spliced back in, give it the
+        // chance to resolve instead of waiting for the next page after this
+        // one, which might not come for a while — or ever, if this was the
+        // last page all along.
+        self.retry_search_if_pending();
         true
     }
 
@@ -936,13 +1094,39 @@ impl AppState {
         self.search_query.clear();
     }
 
+    /// Search `commits.summary`/`author`/`oid` for `search_query`, then, if
+    /// nothing matched and more HEAD history is still out there, ask for the
+    /// next page and try again once it lands — see `poll_load`'s call into
+    /// `retry_search_if_pending`. Matches within what is already loaded
+    /// still land instantly; only a genuine miss pays for a page load.
     pub fn execute_search(&mut self) {
         self.is_searching = false;
         if self.search_query.is_empty() {
             self.search_results.clear();
+            self.search_pending = false;
             return;
         }
 
+        self.run_search();
+        // Only HEAD history has more pages that could still turn up a match.
+        // A file's history and an all-branches load are already complete the
+        // moment they're on screen, so a miss there is a real "not found",
+        // not something waiting on a page.
+        if self.search_results.is_empty()
+            && !self.history_exhausted
+            && self.history == HistoryScope::Head
+        {
+            self.search_pending = true;
+            self.request_more_history();
+        } else {
+            self.search_pending = false;
+        }
+    }
+
+    /// The actual scan over `commits`, shared by `execute_search` and the
+    /// retry it schedules when a search runs out of loaded history before
+    /// finding a match.
+    fn run_search(&mut self) {
         let q = self.search_query.to_lowercase();
         self.search_results.clear();
         for (i, commit) in self.commits.iter().enumerate() {
@@ -956,6 +1140,35 @@ impl AppState {
 
         self.search_index = 0;
         self.jump_to_current_search_result();
+    }
+
+    /// Called after a page lands. If a search came up empty and was waiting
+    /// on more history, re-run it against the newly extended `commits` and
+    /// keep asking for pages until it finds something or the walk is
+    /// exhausted — continuing the revwalk rather than declaring "not found"
+    /// prematurely is the whole point of paginating search.
+    ///
+    /// A no-op while scoped away from HEAD (a file's history, or all
+    /// branches): `self.commits` isn't the HEAD list to search in that case,
+    /// and the page that triggered this call already went to
+    /// `saved_history` rather than `self.commits` for exactly that reason
+    /// (see `apply`'s `PageReady` arm). `search_pending` is left set, so
+    /// `close_history` picks the retry back up once HEAD history — and the
+    /// pages spliced into it while scoped — are back on screen.
+    fn retry_search_if_pending(&mut self) {
+        if !self.search_pending || self.history != HistoryScope::Head {
+            return;
+        }
+        self.run_search();
+        if !self.search_results.is_empty() {
+            self.search_pending = false;
+            self.status = None;
+        } else if self.history_exhausted {
+            self.search_pending = false;
+            self.error(format!("\"{}\" not found", self.search_query));
+        } else {
+            self.request_more_history();
+        }
     }
 
     pub fn next_search_result(&mut self) {

@@ -1,15 +1,44 @@
-//! Background repository loading.
+//! Background repository loading, paginated.
+//!
+//! The HEAD history walk no longer stops at a fixed ceiling. It loads one
+//! page behind the initial progress screen, then the thread stays alive —
+//! same idea as [`crate::app::detail::DetailWorker`] — and answers
+//! [`LoadRequest::NextPage`] by resuming the same `git2::Revwalk` where the
+//! last page left off. A `Revwalk` cannot cross threads (`git2` types are not
+//! `Send`), which is exactly why it has to live here rather than being
+//! reconstructed by the app on demand.
+//!
+//! An `--all` startup load stays one-shot, capped at [`PAGE_SIZE`]: it is
+//! opened far less often than HEAD history (once, only when the CLI flag is
+//! given), and paginating it is future work rather than part of this pass.
+//! Switching scopes *after* startup — `a`, `l`, `Esc` — goes through
+//! [`crate::app::detail::DetailWorker`] instead of this module entirely and
+//! is untouched by pagination either way.
+//!
+//! One rule, different from `DetailWorker`'s coalescing: page requests
+//! accumulate, they are never coalesced. Coalescing keeps only the latest
+//! of a backlog.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, SendError, Sender};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crate::git::commit::CommitInfo;
-use crate::git::repository::{self, GitRepository, Ref, RepoInfo};
+use crate::git::repository::{self, GitRepository, Ref, RepoInfo, WalkStart};
 use crate::graph::layout::{GraphEngine, GraphRow};
 
-pub const COMMIT_LIMIT: usize = 1000;
+/// Commits fetched per page, both for the initial HEAD-history load and every
+/// subsequent [`LoadRequest::NextPage`]. Also the cap on the one-shot `--all`
+/// startup load.
+pub const PAGE_SIZE: usize = 1000;
+
+/// Old name, kept as an alias: other one-shot loads elsewhere in the app
+/// (`Request::FileHistory`, `Request::AllBranchesHistory`/`HeadHistory` in
+/// [`crate::app::detail`]) read as "the usual cap on a single fetch", which is
+/// still exactly what they do; only the HEAD-history walk in this module
+/// became paginated.
+pub const COMMIT_LIMIT: usize = PAGE_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadStage {
@@ -32,20 +61,53 @@ impl LoadStage {
     }
 }
 
-pub struct RepoData {
+/// What only the first page brings: everything that describes the repository
+/// itself rather than its history.
+pub struct RepoInit {
     pub info: RepoInfo,
-    pub commits: Vec<CommitInfo>,
-    pub graph_rows: Vec<GraphRow>,
     pub ref_map: HashMap<String, Vec<Ref>>,
-    pub minimap: Vec<char>,
 }
 
-/// A progress report from the loading thread
+/// One page of history, laid out and measured, ready to append to
+/// `AppState`'s vectors.
+pub struct HistoryPage {
+    pub commits: Vec<CommitInfo>,
+    pub graph_rows: Vec<GraphRow>,
+    pub minimap: Vec<char>,
+    /// `true` when the revwalk had fewer than a full page left: there is
+    /// nothing more to request. An empty page also sets this.
+    pub is_last: bool,
+}
+
+/// A message from the loading thread.
 pub enum LoadMessage {
     Stage(LoadStage),
-    Progress { done: usize, total: Option<usize> },
-    Ready(Box<RepoData>),
+    Progress {
+        done: usize,
+        total: Option<usize>,
+    },
+    /// The first page has landed, together with [`RepoInit`]. Sent exactly
+    /// once per repository open.
+    Ready {
+        init: Box<RepoInit>,
+        page: Box<HistoryPage>,
+    },
+    /// A page requested by [`LoadRequest::NextPage`] has landed. Never sent
+    /// during an `--all` startup load, which has nothing listening for
+    /// `LoadRequest` in the first place (see the module comment).
+    PageReady(Box<HistoryPage>),
     Failed(String),
+}
+
+/// Work sent into the loading thread after the first page.
+///
+/// Presently just "give me the next page". A separate type from
+/// [`LoadMessage`] rather than folded into it because the two travel in
+/// opposite directions down two different channels — the same split as
+/// [`crate::app::detail::Request`] and [`crate::app::detail::Payload`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadRequest {
+    NextPage,
 }
 
 /// Everything the UI needs to draw the loading screen.
@@ -91,55 +153,176 @@ impl LoadingState {
     }
 }
 
-/// Start the one-shot background load behind the progress screen.
+/// Handle to the loading thread: sends page requests, receives messages.
 ///
-/// `all_branches` mirrors the `--all` CLI flag: the history stage then walks
-/// every local branch tip, not just HEAD, so the graph's first frame is
-/// already the all-branches view. Widening this walk is what makes the flag
-/// cheap — one walk instead of a HEAD walk that a later swap would discard,
-/// and the loading screen's progress covers all of it.
-pub fn spawn(path: PathBuf, all_branches: bool) -> Receiver<LoadMessage> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = load(path, all_branches, &tx);
-    });
-    rx
+/// Shaped like [`crate::app::detail::DetailWorker`] but without sequence
+/// numbers or coalescing — see the module comment for why page requests
+/// accumulate instead. `AppState` holds one of these for the lifetime of the
+/// repository, the same way it holds a `DetailWorker`.
+pub struct LoadWorker {
+    tx: Sender<LoadRequest>,
+    rx: Receiver<LoadMessage>,
 }
 
-fn load(
-    path: PathBuf,
-    all_branches: bool,
-    tx: &Sender<LoadMessage>,
-) -> Result<(), SendError<LoadMessage>> {
-    tx.send(LoadMessage::Stage(LoadStage::Opening))?;
+impl LoadWorker {
+    /// Start the background load behind the progress screen.
+    ///
+    /// `all_branches` mirrors the `--all` CLI flag: the history stage then
+    /// walks every local branch tip, not just HEAD, so the graph's first
+    /// frame is already the all-branches view. That walk stays one-shot,
+    /// capped at [`PAGE_SIZE`].
+    pub fn spawn(path: PathBuf, all_branches: bool) -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<LoadRequest>();
+        let (message_tx, message_rx) = mpsc::channel::<LoadMessage>();
+
+        std::thread::spawn(move || worker(path, all_branches, request_rx, message_tx));
+
+        Self {
+            tx: request_tx,
+            rx: message_rx,
+        }
+    }
+
+    /// Ask for the next page. Returns `false` if the worker thread is gone
+    /// (an `--all` startup load, which never reads this channel and exits
+    /// after its one message, or a HEAD-history load that has already
+    /// failed).
+    pub fn request_next_page(&self) -> bool {
+        self.tx.send(LoadRequest::NextPage).is_ok()
+    }
+
+    /// Drain every message currently waiting, passing each to `on_message` in
+    /// order. Returns `false` once the channel has hung up, so the caller
+    /// knows the thread is gone and can stop polling.
+    pub fn poll(&self, mut on_message: impl FnMut(LoadMessage)) -> bool {
+        loop {
+            match self.rx.try_recv() {
+                Ok(message) => on_message(message),
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
+            }
+        }
+    }
+}
+
+fn worker(path: PathBuf, all_branches: bool, rx: Receiver<LoadRequest>, tx: Sender<LoadMessage>) {
+    if tx.send(LoadMessage::Stage(LoadStage::Opening)).is_err() {
+        return;
+    }
 
     let repo = match GitRepository::open(&path) {
         Ok(repo) => repo,
-        Err(err) => return tx.send(LoadMessage::Failed(err.message().to_string())),
+        Err(err) => {
+            let _ = tx.send(LoadMessage::Failed(err.message().to_string()));
+            return;
+        }
+    };
+    let git_dir = repo.path();
+
+    if all_branches {
+        // One-shot: build everything through the old capped path and exit.
+        // Nothing will ever send this thread a `LoadRequest` in this mode.
+        let _ = load_all_at_once(&repo, &git_dir, WalkStart::HeadAndLocalBranches, &tx);
+        return;
+    }
+
+    run_paginated_head_history(&repo, &git_dir, &rx, &tx);
+}
+
+/// Drives the paginated HEAD-history path: the first page synchronously,
+/// then one more page per [`LoadRequest::NextPage`] until the walk is
+/// exhausted, a channel breaks, or the walk itself errors (already reported
+/// via `LoadMessage::Failed`).
+fn run_paginated_head_history(
+    repo: &GitRepository,
+    git_dir: &Path,
+    rx: &Receiver<LoadRequest>,
+    tx: &Sender<LoadMessage>,
+) {
+    let mut revwalk = match repo.walk_revwalk(WalkStart::Head) {
+        Ok(revwalk) => revwalk,
+        Err(err) => {
+            tx.send(LoadMessage::Failed(err.message().to_string())).ok();
+            return;
+        }
+    };
+
+    if tx.send(LoadMessage::Stage(LoadStage::History)).is_err() {
+        return;
+    }
+    let progress = |done: usize| tx.send(LoadMessage::Progress { done, total: None }).is_ok();
+    let (commits, mut is_last) = match repo.next_page(&mut revwalk, PAGE_SIZE, progress) {
+        Ok(page) => page,
+        Err(err) => {
+            tx.send(LoadMessage::Failed(err.message().to_string())).ok();
+            return;
+        }
+    };
+
+    let mut graph_engine = GraphEngine::new();
+    let Some(first_page) = build_page(git_dir, &mut graph_engine, commits, is_last, tx) else {
+        return;
     };
 
     let info = repo.info();
-    let git_dir = repo.path();
-
-    tx.send(LoadMessage::Stage(LoadStage::History))?;
-    let progress = |done: usize| tx.send(LoadMessage::Progress { done, total: None }).is_ok();
-    let commits = if all_branches {
-        repo.commits_all_branches_with_progress(COMMIT_LIMIT, progress)
-    } else {
-        repo.commits_with_progress(COMMIT_LIMIT, progress)
-    }
-    .unwrap_or_default();
-
-    tx.send(LoadMessage::Stage(LoadStage::Graph))?;
-    let graph_rows = GraphEngine::build(&commits);
-
-    tx.send(LoadMessage::Stage(LoadStage::Refs))?;
+    tx.send(LoadMessage::Stage(LoadStage::Refs)).ok();
     let ref_map = repo.ref_map().unwrap_or_default();
 
-    tx.send(LoadMessage::Stage(LoadStage::Minimap))?;
+    if tx
+        .send(LoadMessage::Ready {
+            init: Box::new(RepoInit { info, ref_map }),
+            page: Box::new(first_page),
+        })
+        .is_err()
+    {
+        return;
+    }
+
+    // Idle until the app asks for more, or the walk is already exhausted.
+    // `recv()` blocks this thread on purpose: there is nothing else for it
+    // to do between requests.
+    while !is_last {
+        match rx.recv() {
+            Ok(LoadRequest::NextPage) => {}
+            Err(_) => return, // AppState (and its Sender) dropped; nothing left to serve
+        }
+
+        let (commits, last) = match repo.next_page(&mut revwalk, PAGE_SIZE, |_| true) {
+            Ok(page) => page,
+            Err(err) => {
+                tx.send(LoadMessage::Failed(err.message().to_string())).ok();
+                return;
+            }
+        };
+        is_last = last;
+        let Some(page) = build_page(git_dir, &mut graph_engine, commits, is_last, tx) else {
+            return;
+        };
+        if tx.send(LoadMessage::PageReady(Box::new(page))).is_err() {
+            return;
+        }
+    }
+}
+
+/// Turn a raw batch of commits into a [`HistoryPage`]: lay out its graph rows,
+/// continuing `graph_engine`'s lane state from the previous page rather than
+/// restarting it (so lanes don't reset at a page boundary), and measure its
+/// minimap deltas. `None` means a channel send failed and the caller should
+/// stop.
+fn build_page(
+    git_dir: &Path,
+    graph_engine: &mut GraphEngine,
+    commits: Vec<CommitInfo>,
+    is_last: bool,
+    tx: &Sender<LoadMessage>,
+) -> Option<HistoryPage> {
+    tx.send(LoadMessage::Stage(LoadStage::Graph)).ok()?;
+    let graph_rows: Vec<GraphRow> = commits.iter().map(|c| graph_engine.process(c)).collect();
+
+    tx.send(LoadMessage::Stage(LoadStage::Minimap)).ok()?;
     let oids: Vec<String> = commits.iter().map(|c| c.oid.clone()).collect();
     let total = oids.len();
-    let deltas = repository::commit_deltas_parallel(&git_dir, &oids, |done| {
+    let deltas = repository::commit_deltas_parallel(git_dir, &oids, |done| {
         tx.send(LoadMessage::Progress {
             done,
             total: Some(total),
@@ -147,13 +330,60 @@ fn load(
         .is_ok()
     });
 
-    tx.send(LoadMessage::Ready(Box::new(RepoData {
-        info,
+    Some(HistoryPage {
         commits,
         graph_rows,
-        ref_map,
         minimap: minimap_chars(&deltas),
-    })))
+        is_last,
+    })
+}
+
+/// The old one-shot path, used only for the `--all` startup load. `None`
+/// means a channel send failed.
+fn load_all_at_once(
+    repo: &GitRepository,
+    git_dir: &Path,
+    start: WalkStart,
+    tx: &Sender<LoadMessage>,
+) -> Option<()> {
+    tx.send(LoadMessage::Stage(LoadStage::History)).ok()?;
+    let progress = |done: usize| tx.send(LoadMessage::Progress { done, total: None }).is_ok();
+    let commits = match start {
+        WalkStart::Head => repo.commits_with_progress(COMMIT_LIMIT, progress),
+        WalkStart::HeadAndLocalBranches => {
+            repo.commits_all_branches_with_progress(COMMIT_LIMIT, progress)
+        }
+    }
+    .unwrap_or_default();
+
+    tx.send(LoadMessage::Stage(LoadStage::Graph)).ok()?;
+    let graph_rows = GraphEngine::build(&commits);
+
+    tx.send(LoadMessage::Stage(LoadStage::Refs)).ok()?;
+    let ref_map = repo.ref_map().unwrap_or_default();
+    let info = repo.info();
+
+    tx.send(LoadMessage::Stage(LoadStage::Minimap)).ok()?;
+    let oids: Vec<String> = commits.iter().map(|c| c.oid.clone()).collect();
+    let total = oids.len();
+    let deltas = repository::commit_deltas_parallel(git_dir, &oids, |done| {
+        tx.send(LoadMessage::Progress {
+            done,
+            total: Some(total),
+        })
+        .is_ok()
+    });
+
+    tx.send(LoadMessage::Ready {
+        init: Box::new(RepoInit { info, ref_map }),
+        page: Box::new(HistoryPage {
+            commits,
+            graph_rows,
+            minimap: minimap_chars(&deltas),
+            is_last: true,
+        }),
+    })
+    .ok()
 }
 
 pub fn minimap_chars(deltas: &[(usize, usize)]) -> Vec<char> {
