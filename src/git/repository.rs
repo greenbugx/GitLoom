@@ -184,6 +184,21 @@ impl GitRepository {
         Ok(commits)
     }
 
+    /// Whether `HEAD` names a ref that does not exist yet: a fresh `git init`
+    /// before the first commit, or a freshly created orphan branch.
+    ///
+    /// This is a normal state, not a broken one — every repository starts
+    /// here — and the history reachable from such a HEAD is simply empty. It
+    /// is also the one state in which a [`WalkStart`]-seeded walk cannot even
+    /// be built: `push_head` has no commit to push and reports `UnbornBranch`.
+    /// A broken HEAD (pointing at a missing object, or missing itself) is
+    /// not unborn and still fails its walk as an error.
+    pub fn head_is_unborn(&self) -> bool {
+        self.repo
+            .head()
+            .is_err_and(|err| err.code() == git2::ErrorCode::UnbornBranch)
+    }
+
     /// A revwalk seeded from `start` and sorted the same way
     /// [`GitRepository::walk_commits`] sorts every walk in this module, ready
     /// to be driven page by page with [`GitRepository::next_page`].
