@@ -13,7 +13,7 @@ mod common;
 
 use common::TestRepo;
 use gitloom::app::loading::PAGE_SIZE;
-use gitloom::app::{AppState, HistoryScope};
+use gitloom::app::{AppState, HistoryScope, RepoState};
 use std::time::{Duration, Instant};
 
 /// How far past one full page the fixtures in this file go, so a second page
@@ -39,6 +39,43 @@ fn wait_for(
         assert!(Instant::now() < deadline, "{message}");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// A fresh `git init` has an unborn HEAD: no commit exists for the history
+/// walk to even seed from. That must open as an empty, already-exhausted
+/// history with the repository loaded — what the startup loader did before
+/// pagination, flattening the walk failure into an empty commit list — not
+/// as a full-screen load error.
+#[test]
+fn an_empty_repository_loads_as_an_empty_history() {
+    let repo = TestRepo::init();
+    let mut state = AppState::new(Some(repo.path().to_path_buf()), false);
+
+    wait_for(
+        &mut state,
+        30,
+        "empty repository load never finished",
+        |s| s.loading.is_none(),
+    );
+
+    assert!(
+        matches!(state.repo_state, RepoState::Loaded(..)),
+        "an unborn HEAD should open the repository, not fail the load"
+    );
+    assert!(
+        state.commits.is_empty(),
+        "an empty repository has no commits to show"
+    );
+    assert_eq!(
+        state.graph_rows.len(),
+        state.commits.len(),
+        "graph rows must stay one-per-commit even when that is zero"
+    );
+    assert!(state.minimap.is_empty());
+    assert!(
+        state.history_exhausted,
+        "nothing can follow the empty first page"
+    );
 }
 
 /// The first page alone should land within `PAGE_SIZE` commits, not the

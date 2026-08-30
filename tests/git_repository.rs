@@ -45,6 +45,30 @@ fn walks_every_commit_with_correct_parents() {
     assert_eq!(feature.parents, vec![fixture.base.clone()]);
 }
 
+/// `head_is_unborn` is what separates a fresh `git init` (an empty history,
+/// and a walk that cannot even be seeded) from a repository with commits,
+/// and it must flip the moment the first commit lands.
+#[test]
+fn head_is_unborn_until_the_first_commit() {
+    let empty = TestRepo::init();
+    let repo = GitRepository::open(empty.path()).expect("open empty repo");
+    assert!(
+        repo.head_is_unborn(),
+        "a fresh git init has HEAD pointing at a branch no commit is on"
+    );
+    assert!(
+        repo.walk_revwalk(WalkStart::Head).is_err(),
+        "the unborn HEAD is exactly why an empty repository cannot seed a walk"
+    );
+
+    let (populated, _fixture) = TestRepo::build_standard_fixture();
+    let repo = GitRepository::open(populated.path()).expect("open populated repo");
+    assert!(
+        !repo.head_is_unborn(),
+        "a repository with commits has a born HEAD"
+    );
+}
+
 /// The revwalk is `TOPOLOGICAL | TIME`: every commit must come before its
 /// parents in the returned order, regardless of how ties between sibling
 /// branches are broken.

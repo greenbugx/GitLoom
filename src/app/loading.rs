@@ -11,6 +11,9 @@
 //! An `--all` startup load stays one-shot, capped at [`PAGE_SIZE`]: it is
 //! opened far less often than HEAD history (once, only when the CLI flag is
 //! given), and paginating it is future work rather than part of this pass.
+//! An unborn HEAD — an empty repository, nothing committed yet — takes the
+//! same one-shot path, since there is no commit for a paginated walk to
+//! even start from.
 //! Switching scopes *after* startup — `a`, `l`, `Esc` — goes through
 //! [`crate::app::detail::DetailWorker`] instead of this module entirely and
 //! is untouched by pagination either way.
@@ -93,8 +96,9 @@ pub enum LoadMessage {
         page: Box<HistoryPage>,
     },
     /// A page requested by [`LoadRequest::NextPage`] has landed. Never sent
-    /// during an `--all` startup load, which has nothing listening for
-    /// `LoadRequest` in the first place (see the module comment).
+    /// by a one-shot load (an `--all` startup load, or an empty repository),
+    /// which has nothing listening for `LoadRequest` in the first place (see
+    /// the module comment).
     PageReady(Box<HistoryPage>),
     Failed(String),
 }
@@ -184,9 +188,9 @@ impl LoadWorker {
     }
 
     /// Ask for the next page. Returns `false` if the worker thread is gone
-    /// (an `--all` startup load, which never reads this channel and exits
-    /// after its one message, or a HEAD-history load that has already
-    /// failed).
+    /// (a one-shot load — an `--all` startup load, or an empty repository
+    /// whose HEAD is unborn — which never reads this channel and exits after
+    /// its one message, or a HEAD-history load that has already failed).
     pub fn request_next_page(&self) -> bool {
         self.tx.send(LoadRequest::NextPage).is_ok()
     }
@@ -219,20 +223,36 @@ fn worker(path: PathBuf, all_branches: bool, rx: Receiver<LoadRequest>, tx: Send
     };
     let git_dir = repo.path();
 
-    if all_branches {
-        // One-shot: build everything through the old capped path and exit.
-        // Nothing will ever send this thread a `LoadRequest` in this mode.
-        let _ = load_all_at_once(&repo, &git_dir, WalkStart::HeadAndLocalBranches, &tx);
+    // An unborn HEAD — a fresh `git init` before the first commit — has an
+    // empty history, not a broken one, so the repository must still open.
+    // The paginated path below cannot do that: its first step seeds a walk
+    // from HEAD and there is no commit to seed from. It therefore joins the
+    // one-shot path, which already answers a failed walk with an empty,
+    // final page plus the repository info — exactly what the startup loader
+    // did before pagination existed.
+    if !all_branches && !repo.head_is_unborn() {
+        run_paginated_head_history(&repo, &git_dir, &rx, &tx);
         return;
     }
 
-    run_paginated_head_history(&repo, &git_dir, &rx, &tx);
+    let start = if all_branches {
+        WalkStart::HeadAndLocalBranches
+    } else {
+        WalkStart::Head
+    };
+    // One-shot: build everything through the old capped path and exit.
+    // Nothing will ever send this thread a `LoadRequest` in this mode.
+    let _ = load_all_at_once(&repo, &git_dir, start, &tx);
 }
 
 /// Drives the paginated HEAD-history path: the first page synchronously,
 /// then one more page per [`LoadRequest::NextPage`] until the walk is
 /// exhausted, a channel breaks, or the walk itself errors (already reported
 /// via `LoadMessage::Failed`).
+///
+/// Only called with a born HEAD: an unborn one (an empty repository) is
+/// routed to [`load_all_at_once`] by [`worker`] instead, because the walk
+/// this function seeds cannot start without a commit to push.
 fn run_paginated_head_history(
     repo: &GitRepository,
     git_dir: &Path,
@@ -338,8 +358,10 @@ fn build_page(
     })
 }
 
-/// The old one-shot path, used only for the `--all` startup load. `None`
-/// means a channel send failed.
+/// The old one-shot path: used for the `--all` startup load, and for any
+/// repository whose HEAD is unborn (a fresh `git init`), whose empty
+/// history arrives as one empty, final page. `None` means a channel send
+/// failed.
 fn load_all_at_once(
     repo: &GitRepository,
     git_dir: &Path,
